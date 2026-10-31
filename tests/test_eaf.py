@@ -178,6 +178,30 @@ class TestEaf(unittest.IsolatedAsyncioTestCase):
                     reverse=True,
                     beep=False,
                     max_force=3,
+                    hand_controller_active=False,
+                ),
+            ),
+            (
+                "legacy_hand_controller_moving_state_00_flags_bit2",
+                _firmware_report(version=(3, 1, 9)),
+                _status_report_legacy(
+                    state=0x00,
+                    backlash=0,
+                    step=1_476,
+                    raw_temp=0x8222,
+                    flags=0x26,
+                    max_step=23_000,
+                ),
+                EafStatus(
+                    moving=True,
+                    step=1_476,
+                    max_step=23_000,
+                    temperature_c=33.14,
+                    backlash=0,
+                    reverse=True,
+                    beep=False,
+                    max_force=2,
+                    hand_controller_active=True,
                 ),
             ),
             (
@@ -200,6 +224,7 @@ class TestEaf(unittest.IsolatedAsyncioTestCase):
                     reverse=False,
                     beep=True,
                     max_force=5,
+                    hand_controller_active=False,
                 ),
             ),
             (
@@ -222,6 +247,7 @@ class TestEaf(unittest.IsolatedAsyncioTestCase):
                     reverse=True,
                     beep=True,
                     max_force=4,
+                    hand_controller_active=False,
                 ),
             ),
             (
@@ -244,6 +270,7 @@ class TestEaf(unittest.IsolatedAsyncioTestCase):
                     reverse=False,
                     beep=False,
                     max_force=0,
+                    hand_controller_active=False,
                 ),
             ),
         ]
@@ -514,6 +541,24 @@ class TestEaf(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(settled, 30_058)
             self.assertEqual(mock_sleep.await_count, 2)
+
+        with self.subTest("hand_controller_moving_masks_flag_and_polls_until_settled"):
+            replies = [
+                _firmware_report(version=(3, 1, 9)),
+                _status_report_legacy(state=0x00, backlash=0, speed=9, step=1_470, flags=0x26, max_step=23_000),
+                _status_report_legacy(state=0x00, backlash=0, speed=9, step=1_476, flags=0x22, max_step=23_000),
+            ]
+            with (
+                FakeEafHidBackend(replies=replies) as backend,
+                patch("pyzwohid.hid.asyncio.sleep") as mock_sleep,
+            ):
+                async with await Eaf.open(DEV_PATH) as focuser:
+                    settled = await focuser.stop()
+
+            self.assertEqual(settled, 1_476)
+            self.assertEqual(mock_sleep.await_count, 1)
+            # Outgoing tx[13] masks out _FLAG_HAND_CONTROLLER (0x26 & ~0x04 == 0x22)
+            self.assertEqual(backend.sent_reports[2][13], 0x22)
 
     async def test_move_and_stop_validate_arguments_and_reject_busy_move(self) -> None:
         with FakeEafHidBackend(

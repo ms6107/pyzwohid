@@ -27,6 +27,7 @@ _TEMP_SCALE = 100.0
 _MIN_VALID_RAW_TEMP = 10_000
 _FLAG_BEEP = 0x01
 _FLAG_REVERSE = 0x02
+_FLAG_HAND_CONTROLLER = 0x04
 
 # Master control frame (03 <run> <backlash> <b6..b9> <opcode> 00 00 <flags> <max_hi..lo>)
 _CMD_CONTROL = 0x03
@@ -42,7 +43,7 @@ class EafStatus(ZwoHidStatus):
     """Snapshot of EAF status and telemetry from a single 0x03 status report.
 
     Attributes:
-        moving: True while the focuser is moving.
+        moving: True while the focuser is moving (via USB command or hand controller).
         step: Current focuser position in steps (0..max_step).
         max_step: Configured maximum step limit (1..step_range).
         temperature_c: Probe temperature in degrees Celsius, or None if disconnected.
@@ -50,6 +51,7 @@ class EafStatus(ZwoHidStatus):
         reverse: True if stepper motor direction is reversed.
         beep: True if the motion buzzer is enabled.
         max_force: Configured motor torque / holding force level (0..15).
+        hand_controller_active: True while a hand controller button is actively moving the focuser.
     """
 
     step: int
@@ -59,6 +61,7 @@ class EafStatus(ZwoHidStatus):
     reverse: bool
     beep: bool
     max_force: int
+    hand_controller_active: bool
 
 
 class Eaf(ZwoHidDevice[EafStatus]):
@@ -110,8 +113,9 @@ class Eaf(ZwoHidDevice[EafStatus]):
         raw_temp = int.from_bytes(reply[11:13], "big")
         temperature_c = (raw_temp - _TEMP_OFFSET) / _TEMP_SCALE if _MIN_VALID_RAW_TEMP < raw_temp < 0xFFFF else None
         flags = reply[13]
+        hand_controller_active = bool(flags & _FLAG_HAND_CONTROLLER)
         status = EafStatus(
-            moving=state == _STATE_MOVING,
+            moving=state == _STATE_MOVING or hand_controller_active,
             step=step,
             max_step=max_step,
             temperature_c=temperature_c,
@@ -119,6 +123,7 @@ class Eaf(ZwoHidDevice[EafStatus]):
             reverse=bool(flags & _FLAG_REVERSE),
             beep=bool(flags & _FLAG_BEEP),
             max_force=flags >> 4,
+            hand_controller_active=hand_controller_active,
         )
         return status, reply
 
@@ -139,7 +144,7 @@ class Eaf(ZwoHidDevice[EafStatus]):
         max_step: int | None = None,
     ) -> bytes:
         actual_backlash = status_reply[5] if backlash is None else backlash
-        actual_flags = status_reply[13] if flags is None else flags
+        actual_flags = (status_reply[13] if flags is None else flags) & ~_FLAG_HAND_CONTROLLER
         max_step_lo = status_reply[14:16] if max_step is None else (max_step & 0xFFFF).to_bytes(2, "big")
         if self.firmware_version > _LEGACY_FW_LIMIT:
             max_step_hi = status_reply[6] if max_step is None else (max_step >> 16) & 0xFF
