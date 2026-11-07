@@ -178,8 +178,14 @@ class ZwoHidDevice(Generic[_StatusT]):
         """Send a 16-byte `[03 7e 5a <payload>...]` feature report."""
         await _run_in_executor(self._send_sync, payload)
 
-    def _query_sync(self, payload: bytes, reply_len: int = _REPLY_LEN) -> bytes:
+    def _query_sync(
+        self,
+        payload: bytes,
+        reply_len: int = _REPLY_LEN,
+        override_expected_selector: int | None = None,
+    ) -> bytes:
         report = (_CMD_HEADER + payload).ljust(_CMD_LEN, b"\x00")
+        expected_selector = payload[-1] if override_expected_selector is None else override_expected_selector
         for _ in range(_QUERY_ATTEMPTS):
             try:
                 self._device.send_feature_report(report)
@@ -188,13 +194,18 @@ class ZwoHidDevice(Generic[_StatusT]):
                 raise ZwoError(f"HID I/O failed on {self.path!r}: {exc}") from exc
             if len(reply) < reply_len or not reply.startswith(_REPLY_HEADER):
                 raise ZwoError(f"Unexpected HID reply for {payload.hex(' ')}: {reply.hex(' ')}")
-            # Every query echoes its selector (payload[-1]) in reply[3]; a mismatch means
-            # another OS process overwrote the MCU's single reply buffer before our read.
-            if reply[3] == payload[-1]:
+            # Queries echo their selector (payload[-1], unless overridden) in reply[3]; a mismatch
+            # means another OS process overwrote the MCU's single reply buffer before our read.
+            if reply[3] == expected_selector:
                 return reply
         raise ZwoQueryCollisionError(f"HID query collision for {payload.hex(' ')}: {reply.hex(' ')}")
 
-    async def _query(self, payload: bytes, reply_len: int = _REPLY_LEN) -> bytes:
+    async def _query(
+        self,
+        payload: bytes,
+        reply_len: int = _REPLY_LEN,
+        override_expected_selector: int | None = None,
+    ) -> bytes:
         """Send `[03 7e 5a <payload>...]` and read its `[01 7e 5a <selector>...]` reply.
 
         `send_feature_report` (`SET_REPORT`) is a synchronous USB Control Transfer (~3 ms)
@@ -210,12 +221,12 @@ class ZwoHidDevice(Generic[_StatusT]):
         If two independent OS processes open the same HID device and their queries with
         different selectors interleave (`A: send -> B: send -> A: get -> B: get`), `B`'s
         send overwrites the MCU reply register so both reads return `B`'s reply (never
-        swapped). `B` matches `reply[3] == payload[-1]` on attempt 1 and exits, leaving
-        `A` uncontended to succeed on the immediate next attempt without sleep or backoff.
-        Raises `ZwoQueryCollisionError` if all `_QUERY_ATTEMPTS` attempts collide.
+        swapped). `B` matches `reply[3] == expected_selector` on attempt 1 and exits,
+        leaving `A` uncontended to succeed on the immediate next attempt without sleep or
+        backoff. Raises `ZwoQueryCollisionError` if all `_QUERY_ATTEMPTS` attempts collide.
         (Verified on Linux `hidraw` only so far; macOS/Windows HID backends are untested.)
         """
-        return await _run_in_executor(self._query_sync, payload, reply_len)
+        return await _run_in_executor(self._query_sync, payload, reply_len, override_expected_selector)
 
     async def get_firmware_version(self) -> tuple[int, int, int]:
         """Query (`02 04`) and return the `(major, minor, build)` firmware version."""

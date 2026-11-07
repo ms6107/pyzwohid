@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import struct
 from dataclasses import dataclass
 from typing import Any, Self
 
@@ -28,6 +29,13 @@ _MIN_VALID_RAW_TEMP = 10_000
 _FLAG_BEEP = 0x01
 _FLAG_REVERSE = 0x02
 _FLAG_HAND_CONTROLLER = 0x04
+
+# Battery telemetry query (02 1e) and reply decoding (EAF Pro)
+_CMD_GET_BATTERY_STATUS = b"\x02\x1e"
+_BATTERY_REPLY_SELECTOR = 0x00
+_BATTERY_TEMP_OFFSET = 100
+_MIN_BATTERY_TEMP_C = -40
+_MAX_BATTERY_TEMP_C = 87
 
 # Master control frame (03 <run> <backlash> <b6..b9> <opcode> 00 00 <flags> <max_hi..lo>)
 _CMD_CONTROL = 0x03
@@ -62,6 +70,29 @@ class EafStatus(ZwoHidStatus):
     beep: bool
     max_force: int
     hand_controller_active: bool
+
+
+@dataclass(frozen=True, slots=True)
+class EafBatteryStatus:
+    """Snapshot of EAF Pro battery telemetry from a single 0x1e query (`01 7e 5a 00 ...`).
+
+    Attributes:
+        percentage: Remaining state of charge in percent (0..100).
+        health: Battery state of health in percent (0..100).
+        temperature_c: Battery temperature in degrees Celsius (-40..87).
+        voltage_mv: Battery terminal voltage in millivolts.
+        charge_current_ma: Charging current in milliamperes.
+        discharge_current_ma: Discharging current in milliamperes.
+        charge_voltage_mv: Charging input voltage in millivolts.
+    """
+
+    percentage: int
+    health: int
+    temperature_c: int
+    voltage_mv: int
+    charge_current_ma: int
+    discharge_current_ma: int
+    charge_voltage_mv: int
 
 
 class Eaf(ZwoHidDevice[EafStatus]):
@@ -131,6 +162,31 @@ class Eaf(ZwoHidDevice[EafStatus]):
         """Return EafStatus from a 0x03 status report."""
         status, _ = await self._read_status_report()
         return status
+
+    async def get_battery_status(self) -> EafBatteryStatus:
+        """Query (`02 1e`) and return `EafBatteryStatus` on battery-equipped EAF Pro models."""
+        reply = await self._query(_CMD_GET_BATTERY_STATUS, override_expected_selector=_BATTERY_REPLY_SELECTOR)
+        (
+            raw_temp,
+            voltage_mv,
+            charge_current_ma,
+            percentage,
+            discharge_current_ma,
+            health,
+            charge_voltage_mv,
+        ) = struct.unpack(">BHHBHBH", reply[5:16])
+        temperature_c = raw_temp - _BATTERY_TEMP_OFFSET
+        if not (_MIN_BATTERY_TEMP_C <= temperature_c <= _MAX_BATTERY_TEMP_C) or percentage > 100 or health > 100:
+            raise ZwoError(f"Invalid EAF battery status: {reply.hex(' ')}")
+        return EafBatteryStatus(
+            percentage=percentage,
+            health=health,
+            temperature_c=temperature_c,
+            voltage_mv=voltage_mv,
+            charge_current_ma=charge_current_ma,
+            discharge_current_ma=discharge_current_ma,
+            charge_voltage_mv=charge_voltage_mv,
+        )
 
     def _build_control_payload(
         self,

@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import math
+import struct
 import threading
 import unittest
 from typing import Any
 from unittest.mock import patch
 
-from pyzwohid import Eaf, EafStatus, ZwoDevicePathError, ZwoError
+from pyzwohid import Eaf, EafBatteryStatus, EafStatus, ZwoDevicePathError, ZwoError
 from tests.test_hid import FakeHidBackend, _firmware_report
 
 DEV_PATH = "/dev/hidraw14"
@@ -80,6 +81,28 @@ def _status_report_modern(
             (max_step >> 8) & 0xFF,
             max_step & 0xFF,
         )
+    )
+
+
+def _battery_report(
+    *,
+    raw_temp: int = 0x7E,
+    voltage_mv: int = 3786,
+    charge_current_ma: int = 455,
+    percentage: int = 6,
+    discharge_current_ma: int = 0,
+    health: int = 100,
+    charge_voltage_mv: int = 4800,
+) -> bytes:
+    return b"\x01\x7e\x5a\x00\xb6" + struct.pack(
+        ">BHHBHBH",
+        raw_temp,
+        voltage_mv,
+        charge_current_ma,
+        percentage,
+        discharge_current_ma,
+        health,
+        charge_voltage_mv,
     )
 
 
@@ -315,6 +338,41 @@ class TestEaf(unittest.IsolatedAsyncioTestCase):
                         await focuser.get_status()
                 self.assertEqual(backend.open_count, 1)
                 self.assertEqual(backend.close_count, 1)
+
+    async def test_get_battery_status_decodes_and_validates_bounds(self) -> None:
+        fw_report = _firmware_report(version=(3, 8, 1))
+        with FakeEafHidBackend(replies=[fw_report, _battery_report()]) as backend:
+            async with await Eaf.open(DEV_PATH) as focuser:
+                self.assertEqual(
+                    await focuser.get_battery_status(),
+                    EafBatteryStatus(
+                        percentage=6,
+                        health=100,
+                        temperature_c=26,
+                        voltage_mv=3786,
+                        charge_current_ma=455,
+                        discharge_current_ma=0,
+                        charge_voltage_mv=4800,
+                    ),
+                )
+            self.assertEqual(
+                backend.sent_reports,
+                [
+                    b"\x03\x7e\x5a\x02\x04".ljust(16, b"\x00"),
+                    b"\x03\x7e\x5a\x02\x1e".ljust(16, b"\x00"),
+                ],
+            )
+
+        for label, bad_report in (
+            ("temp_below_min", _battery_report(raw_temp=59)),
+            ("temp_above_max", _battery_report(raw_temp=188)),
+            ("percentage_above_100", _battery_report(percentage=101)),
+            ("health_above_100", _battery_report(health=101)),
+        ):
+            with self.subTest(case=label), FakeEafHidBackend(replies=[fw_report, bad_report]):
+                async with await Eaf.open(DEV_PATH) as focuser:
+                    with self.assertRaises(ZwoError):
+                        await focuser.get_battery_status()
 
     async def test_reset_position_legacy_and_modern_preserves_device_settings(self) -> None:
         with self.subTest("legacy_16bit"):

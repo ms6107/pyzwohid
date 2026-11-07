@@ -7,12 +7,13 @@
 
 from __future__ import annotations
 
-from .eaf import Eaf, EafStatus
+from .eaf import Eaf, EafBatteryStatus, EafStatus
 from .efw import Efw, EfwStatus
 from .hid import ZwoDevicePathError, ZwoError, ZwoHidDevice, ZwoHidStatus, ZwoQueryCollisionError
 
 __all__ = [
     "Eaf",
+    "EafBatteryStatus",
     "EafStatus",
     "Efw",
     "EfwStatus",

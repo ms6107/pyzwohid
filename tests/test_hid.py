@@ -236,6 +236,16 @@ class TestZwoHidDevice(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(ctx.exception, ZwoQueryCollisionError)
             self.assertEqual(len(backend.sent_reports), 3)
 
+        overridden_reply = b"\x01\x7e\x5a\x00".ljust(16, b"\x00")
+        unoverridden_reply = b"\x01\x7e\x5a\x1e".ljust(16, b"\x00")
+        with FakeHidBackend(replies=[unoverridden_reply, overridden_reply]) as backend:
+            async with await _DummyHidDevice.open(DEV_PATH) as dev:
+                self.assertEqual(
+                    await dev._query(b"\x02\x1e", override_expected_selector=0x00),
+                    overridden_reply,
+                )
+            self.assertEqual(len(backend.sent_reports), 2)
+
     async def test_get_firmware_version_and_rejects_zero_version(self) -> None:
         with FakeHidBackend(replies=[_firmware_report(version=(3, 5, 2))]) as backend:
             async with await _DummyHidDevice.open(DEV_PATH) as dev:
