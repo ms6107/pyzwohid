@@ -213,8 +213,13 @@ class TestZwoHidDevice(unittest.IsolatedAsyncioTestCase):
     async def test_query_rejects_bad_header_and_truncated_reply(self) -> None:
         for label, report in (
             ("bad_header", bytes(16)),
-            ("truncated_header_only", b"\x01\x7e\x5a"),
-            ("truncated_15_bytes", _dummy_status_report()[:15]),
+            ("truncated_1_byte_unsupported_cmd", b"\x01"),
+            # 3-byte header passes startswith(_REPLY_HEADER) but has no selector byte at reply[3];
+            # requires `len(reply) < 4` before indexing `reply[3]`.
+            ("truncated_3_byte_header_without_selector", b"\x01\x7e\x5a"),
+            # Matching selector (reply[3] == 0x01) but shorter than requested reply_len (16);
+            # requires `len(reply) < reply_len` inside `if reply[3] == expected_selector:`.
+            ("truncated_15_bytes_with_matching_selector", _dummy_status_report()[:15]),
         ):
             with self.subTest(case=label), FakeHidBackend(replies=[report]) as backend:
                 async with await _DummyHidDevice.open(DEV_PATH) as dev:
@@ -224,20 +229,27 @@ class TestZwoHidDevice(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(backend.sent_reports), 1)
 
     async def test_query_retries_on_selector_collision_and_raises_after_exhausting_retries(self) -> None:
-        other_reply_16 = b"\x01\x7e\x5a\x04".ljust(16, b"\x00")
-        other_reply_12 = b"\x01\x7e\x5a\x0d".ljust(12, b"\x00")
-        replies = [other_reply_16, other_reply_12, _dummy_status_report(moving=False)]
-        with FakeHidBackend(replies=replies) as backend:
-            async with await _DummyHidDevice.open(DEV_PATH) as dev:
-                self.assertEqual(await dev.get_status(), ZwoHidStatus(moving=False))
-            self.assertEqual(len(backend.sent_reports), 3)
+        # Both 16-byte (e.g. 02 04 firmware) and shorter 12-byte (e.g. 02 0d alias) valid replies
+        # from another process must be treated as selector collisions when expecting 16 bytes;
+        # checking `len(reply) < reply_len` before `reply[3] == expected_selector` would falsely
+        # raise ZwoError on the 12-byte alias reply instead of retrying.
+        for label, colliding_reply in (
+            ("16_byte_firmware_reply", b"\x01\x7e\x5a\x04".ljust(16, b"\x00")),
+            ("12_byte_alias_reply_against_16_byte_query", b"\x01\x7e\x5a\x0d5v1".ljust(12, b"\x00")),
+        ):
+            with self.subTest(collision=label):
+                replies = [colliding_reply, colliding_reply, _dummy_status_report(moving=False)]
+                with FakeHidBackend(replies=replies) as backend:
+                    async with await _DummyHidDevice.open(DEV_PATH) as dev:
+                        self.assertEqual(await dev.get_status(), ZwoHidStatus(moving=False))
+                    self.assertEqual(len(backend.sent_reports), 3)
 
-        with FakeHidBackend(replies=[other_reply_12]) as backend:
-            with self.assertRaises(ZwoError) as ctx:
-                async with await _DummyHidDevice.open(DEV_PATH) as dev:
-                    await dev.get_status()
-            self.assertIsInstance(ctx.exception, ZwoQueryCollisionError)
-            self.assertEqual(len(backend.sent_reports), 3)
+                with FakeHidBackend(replies=[colliding_reply]) as backend:
+                    with self.assertRaises(ZwoError) as ctx:
+                        async with await _DummyHidDevice.open(DEV_PATH) as dev:
+                            await dev.get_status()
+                    self.assertIsInstance(ctx.exception, ZwoQueryCollisionError)
+                    self.assertEqual(len(backend.sent_reports), 3)
 
         overridden_reply = b"\x01\x7e\x5a\x00".ljust(16, b"\x00")
         unoverridden_reply = b"\x01\x7e\x5a\x1e".ljust(16, b"\x00")
