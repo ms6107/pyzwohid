@@ -192,11 +192,13 @@ class ZwoHidDevice(Generic[_StatusT]):
                 reply = bytes(self._device.get_feature_report(_REPLY_REPORT_ID, _REPLY_LEN))
             except Exception as exc:
                 raise ZwoError(f"HID I/O failed on {self.path!r}: {exc}") from exc
-            if len(reply) < reply_len or not reply.startswith(_REPLY_HEADER):
+            if len(reply) < 4 or not reply.startswith(_REPLY_HEADER):
                 raise ZwoError(f"Unexpected HID reply for {payload.hex(' ')}: {reply.hex(' ')}")
             # Queries echo their selector (payload[-1], unless overridden) in reply[3]; a mismatch
             # means another OS process overwrote the MCU's single reply buffer before our read.
             if reply[3] == expected_selector:
+                if len(reply) < reply_len:
+                    raise ZwoError(f"Unexpected HID reply for {payload.hex(' ')}: {reply.hex(' ')}")
                 return reply
         raise ZwoQueryCollisionError(f"HID query collision for {payload.hex(' ')}: {reply.hex(' ')}")
 

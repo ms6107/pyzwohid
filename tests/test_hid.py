@@ -216,20 +216,23 @@ class TestZwoHidDevice(unittest.IsolatedAsyncioTestCase):
             ("truncated_header_only", b"\x01\x7e\x5a"),
             ("truncated_15_bytes", _dummy_status_report()[:15]),
         ):
-            with self.subTest(case=label), FakeHidBackend(replies=[report]):
+            with self.subTest(case=label), FakeHidBackend(replies=[report]) as backend:
                 async with await _DummyHidDevice.open(DEV_PATH) as dev:
-                    with self.assertRaises(ZwoError):
+                    with self.assertRaises(ZwoError) as ctx:
                         await dev.get_status()
+                self.assertNotIsInstance(ctx.exception, ZwoQueryCollisionError)
+                self.assertEqual(len(backend.sent_reports), 1)
 
     async def test_query_retries_on_selector_collision_and_raises_after_exhausting_retries(self) -> None:
-        other_reply = b"\x01\x7e\x5a\x04".ljust(16, b"\x00")
-        replies = [other_reply, other_reply, _dummy_status_report(moving=False)]
+        other_reply_16 = b"\x01\x7e\x5a\x04".ljust(16, b"\x00")
+        other_reply_12 = b"\x01\x7e\x5a\x0d".ljust(12, b"\x00")
+        replies = [other_reply_16, other_reply_12, _dummy_status_report(moving=False)]
         with FakeHidBackend(replies=replies) as backend:
             async with await _DummyHidDevice.open(DEV_PATH) as dev:
                 self.assertEqual(await dev.get_status(), ZwoHidStatus(moving=False))
             self.assertEqual(len(backend.sent_reports), 3)
 
-        with FakeHidBackend(replies=[other_reply]) as backend:
+        with FakeHidBackend(replies=[other_reply_12]) as backend:
             with self.assertRaises(ZwoError) as ctx:
                 async with await _DummyHidDevice.open(DEV_PATH) as dev:
                     await dev.get_status()
