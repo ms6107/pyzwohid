@@ -30,12 +30,13 @@ _FLAG_BEEP = 0x01
 _FLAG_REVERSE = 0x02
 _FLAG_HAND_CONTROLLER = 0x04
 
-# Battery telemetry query (02 1e) and reply decoding (EAF Pro)
+# Battery telemetry (02 1e) and error code (02 05) queries (EAF Pro)
 _CMD_GET_BATTERY_STATUS = b"\x02\x1e"
 _BATTERY_REPLY_SELECTOR = 0x00
 _BATTERY_TEMP_OFFSET = 100
 _MIN_BATTERY_TEMP_C = -40
 _MAX_BATTERY_TEMP_C = 87
+_CMD_GET_ERROR_CODE = b"\x02\x05"
 
 # Master control frame (03 <run> <backlash> <b6..b9> <opcode> 00 00 <flags> <max_hi..lo>)
 _CMD_CONTROL = 0x03
@@ -187,6 +188,14 @@ class Eaf(ZwoHidDevice[EafStatus]):
             discharge_current_ma=discharge_current_ma,
             charge_voltage_mv=charge_voltage_mv,
         )
+
+    async def get_error_code(self) -> tuple[str, str]:
+        """Query (`02 05`) and return `(motor_error_code, battery_error_code)` (e.g. `("E0", "E0")`)."""
+        reply = await self._query(_CMD_GET_ERROR_CODE)
+        if reply[4] != ord("E") or not reply[5:7].isdigit():
+            raise ZwoError(f"Invalid EAF error code: {reply.hex(' ')}")
+        motor_digit, battery_digit = reply[5:7]
+        return (f"E{chr(motor_digit)}", f"E{chr(battery_digit)}")
 
     def _build_control_payload(
         self,

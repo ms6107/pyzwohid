@@ -374,6 +374,33 @@ class TestEaf(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(ZwoError):
                         await focuser.get_battery_status()
 
+    async def test_get_error_code_decodes_and_validates_format(self) -> None:
+        fw_report = _firmware_report(version=(3, 8, 1))
+        for raw, expected in (
+            (b"E00\x00", ("E0", "E0")),
+            (b"E50\x00", ("E5", "E0")),
+            (b"E06\x00", ("E0", "E6")),
+            (b"E58\x00", ("E5", "E8")),
+        ):
+            reply = (b"\x01\x7e\x5a\x05" + raw).ljust(16, b"\x00")
+            with self.subTest(raw=raw), FakeEafHidBackend(replies=[fw_report, reply]) as backend:
+                async with await Eaf.open(DEV_PATH) as focuser:
+                    self.assertEqual(await focuser.get_error_code(), expected)
+                self.assertEqual(
+                    backend.sent_reports,
+                    [
+                        b"\x03\x7e\x5a\x02\x04".ljust(16, b"\x00"),
+                        b"\x03\x7e\x5a\x02\x05".ljust(16, b"\x00"),
+                    ],
+                )
+
+        for bad_raw in (b"\x00\x00\x00\x00", b"X00\x00", b"EA0\x00", b"E0\xb2\x00"):
+            bad_reply = (b"\x01\x7e\x5a\x05" + bad_raw).ljust(16, b"\x00")
+            with self.subTest(bad_raw=bad_raw), FakeEafHidBackend(replies=[fw_report, bad_reply]):
+                async with await Eaf.open(DEV_PATH) as focuser:
+                    with self.assertRaises(ZwoError):
+                        await focuser.get_error_code()
+
     async def test_reset_position_legacy_and_modern_preserves_device_settings(self) -> None:
         with self.subTest("legacy_16bit"):
             replies = [
