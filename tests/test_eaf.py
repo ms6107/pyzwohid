@@ -401,6 +401,35 @@ class TestEaf(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(ZwoError):
                         await focuser.get_error_code()
 
+    async def test_get_and_set_led_state(self) -> None:
+        fw_report = _firmware_report(version=(3, 8, 1))
+        replies = [
+            fw_report,
+            b"\x01\x7e\x5a\x1f\x01".ljust(16, b"\x00"),
+            b"\x01\x7e\x5a\x1f\x00".ljust(16, b"\x00"),
+        ]
+        with FakeEafHidBackend(replies=replies) as backend:
+            async with await Eaf.open(DEV_PATH) as focuser:
+                self.assertTrue(await focuser.get_led_state())
+                await focuser.set_led_state(False)
+                self.assertFalse(await focuser.get_led_state())
+                await focuser.set_led_state(True)
+            self.assertEqual(
+                backend.sent_reports,
+                [
+                    b"\x03\x7e\x5a\x02\x04".ljust(16, b"\x00"),
+                    b"\x03\x7e\x5a\x02\x1f".ljust(16, b"\x00"),
+                    b"\x03\x7e\x5a\x20\x00".ljust(16, b"\x00"),
+                    b"\x03\x7e\x5a\x02\x1f".ljust(16, b"\x00"),
+                    b"\x03\x7e\x5a\x20\x01".ljust(16, b"\x00"),
+                ],
+            )
+
+        with FakeEafHidBackend(replies=[fw_report, b"\x01\x7e\x5a\x1f\x02".ljust(16, b"\x00")]):
+            async with await Eaf.open(DEV_PATH) as focuser:
+                with self.assertRaises(ZwoError):
+                    await focuser.get_led_state()
+
     async def test_reset_position_legacy_and_modern_preserves_device_settings(self) -> None:
         with self.subTest("legacy_16bit"):
             replies = [

@@ -30,13 +30,15 @@ _FLAG_BEEP = 0x01
 _FLAG_REVERSE = 0x02
 _FLAG_HAND_CONTROLLER = 0x04
 
-# Battery telemetry (02 1e) and error code (02 05) queries (EAF Pro)
+# EAF Pro telemetry and LED control (02 1e, 02 05, 02 1f, 20 <00|01>)
 _CMD_GET_BATTERY_STATUS = b"\x02\x1e"
 _BATTERY_REPLY_SELECTOR = 0x00
 _BATTERY_TEMP_OFFSET = 100
 _MIN_BATTERY_TEMP_C = -40
 _MAX_BATTERY_TEMP_C = 87
 _CMD_GET_ERROR_CODE = b"\x02\x05"
+_CMD_GET_LED_STATE = b"\x02\x1f"
+_CMD_SET_LED_STATE = 0x20
 
 # Master control frame (03 <run> <backlash> <b6..b9> <opcode> 00 00 <flags> <max_hi..lo>)
 _CMD_CONTROL = 0x03
@@ -196,6 +198,18 @@ class Eaf(ZwoHidDevice[EafStatus]):
             raise ZwoError(f"Invalid EAF error code: {reply.hex(' ')}")
         motor_digit, battery_digit = reply[5:7]
         return (f"E{chr(motor_digit)}", f"E{chr(battery_digit)}")
+
+    async def get_led_state(self) -> bool:
+        """Query (`02 1f`) and return whether the EAF Pro status LED is enabled."""
+        reply = await self._query(_CMD_GET_LED_STATE)
+        state = reply[4]
+        if state not in (0, 1):
+            raise ZwoError(f"Invalid EAF LED state=0x{state:02x}: {reply.hex(' ')}")
+        return bool(state)
+
+    async def set_led_state(self, enabled: bool) -> None:
+        """Enable or disable (`20 <00|01>`) the EAF Pro status LED."""
+        await self._send(bytes((_CMD_SET_LED_STATE, 1 if enabled else 0)))
 
     def _build_control_payload(
         self,
