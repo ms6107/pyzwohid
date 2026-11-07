@@ -10,7 +10,7 @@ Endpoint 0 using a shared `7e 5a` (`"~Z"`) framing protocol:
 
 - **Host -> Device (`SET_REPORT`, Report ID `0x03`, 16 bytes):**
   `03 7e 5a <payload> 00 ...` (zero-padded to 16 bytes).
-- **Device -> Host (`GET_REPORT`, Report ID `0x01`, 16–17 bytes):**
+- **Device -> Host (`GET_REPORT`, Report ID `0x01`, 12–16 bytes):**
   `01 7e 5a <selector> <data ...>`, where `reply[3]` echoes `payload[-1]`.
 """
 
@@ -30,11 +30,15 @@ _CMD_LEN = 16
 
 _REPLY_REPORT_ID = 0x01
 _REPLY_HEADER = b"\x01\x7e\x5a"
-_REPLY_LEN = 17
-_MIN_REPLY_LEN = 16
+_REPLY_LEN = 16
+_ID_LEN = 8
+_ID_REPLY_LEN = 12
 _QUERY_ATTEMPTS = 3
 _POLL_INTERVAL_S = 0.2
 _CMD_GET_FIRMWARE = b"\x02\x04"
+_CMD_GET_SERIAL_NUMBER = b"\x02\x0c"
+_CMD_GET_ALIAS = b"\x02\x0d"
+_CMD_SET_ALIAS = b"\x0d"
 _CMD_CLEAR_ERROR = b"\x01\x0f"
 
 # All hidapi calls execute on a single dedicated worker thread so that hid_init,
@@ -174,7 +178,7 @@ class ZwoHidDevice(Generic[_StatusT]):
         """Send a 16-byte `[03 7e 5a <payload>...]` feature report."""
         await _run_in_executor(self._send_sync, payload)
 
-    def _query_sync(self, payload: bytes) -> bytes:
+    def _query_sync(self, payload: bytes, reply_len: int = _REPLY_LEN) -> bytes:
         report = (_CMD_HEADER + payload).ljust(_CMD_LEN, b"\x00")
         for _ in range(_QUERY_ATTEMPTS):
             try:
@@ -182,7 +186,7 @@ class ZwoHidDevice(Generic[_StatusT]):
                 reply = bytes(self._device.get_feature_report(_REPLY_REPORT_ID, _REPLY_LEN))
             except Exception as exc:
                 raise ZwoError(f"HID I/O failed on {self.path!r}: {exc}") from exc
-            if len(reply) < _MIN_REPLY_LEN or not reply.startswith(_REPLY_HEADER):
+            if len(reply) < reply_len or not reply.startswith(_REPLY_HEADER):
                 raise ZwoError(f"Unexpected HID reply for {payload.hex(' ')}: {reply.hex(' ')}")
             # Every query echoes its selector (payload[-1]) in reply[3]; a mismatch means
             # another OS process overwrote the MCU's single reply buffer before our read.
@@ -190,14 +194,16 @@ class ZwoHidDevice(Generic[_StatusT]):
                 return reply
         raise ZwoQueryCollisionError(f"HID query collision for {payload.hex(' ')}: {reply.hex(' ')}")
 
-    async def _query(self, payload: bytes) -> bytes:
+    async def _query(self, payload: bytes, reply_len: int = _REPLY_LEN) -> bytes:
         """Send `[03 7e 5a <payload>...]` and read its `[01 7e 5a <selector>...]` reply.
 
         `send_feature_report` (`SET_REPORT`) is a synchronous USB Control Transfer (~3 ms)
         that populates the MCU's single `0x01` reply register in RAM before returning, and
         `get_feature_report` (`GET_REPORT`, ~3 ms) reads that register non-destructively
-        (requesting up to 17 bytes as in the vendor SDK; the EFW USB HID report descriptor
-        declares Report ID `0x01` as 15 payload bytes + 1 report ID byte = 16 bytes).
+        (up to 16 bytes: 15 payload bytes + 1 Report ID byte as declared in the USB HID
+        report descriptor; `get_feature_report` slices to the actual transfer length
+        returned by the hardware, e.g. 16 bytes for status/firmware/serial queries and
+        12 bytes for 8-byte alias queries).
 
         Within this process, `_EXECUTOR` serializes each `_query_sync` call end-to-end.
 
@@ -209,7 +215,7 @@ class ZwoHidDevice(Generic[_StatusT]):
         Raises `ZwoQueryCollisionError` if all `_QUERY_ATTEMPTS` attempts collide.
         (Verified on Linux `hidraw` only so far; macOS/Windows HID backends are untested.)
         """
-        return await _run_in_executor(self._query_sync, payload)
+        return await _run_in_executor(self._query_sync, payload, reply_len)
 
     async def get_firmware_version(self) -> tuple[int, int, int]:
         """Query (`02 04`) and return the `(major, minor, build)` firmware version."""
@@ -218,6 +224,26 @@ class ZwoHidDevice(Generic[_StatusT]):
         if (major, minor, build) == (0, 0, 0):
             raise ZwoError(f"Invalid firmware version 0.0.0: {reply.hex(' ')}")
         return (major, minor, build)
+
+    async def get_serial_number(self) -> str:
+        """Query (`02 0c`) and return the 8-byte hardware serial number as a 16-character hex string."""
+        reply = await self._query(_CMD_GET_SERIAL_NUMBER, reply_len=_ID_REPLY_LEN)
+        return reply[4:12].hex()
+
+    async def get_alias(self) -> str:
+        """Query (`02 0d`) and return the 8-byte ASCII flash alias (`""` if unset)."""
+        reply = await self._query(_CMD_GET_ALIAS, reply_len=_ID_REPLY_LEN)
+        raw_alias = reply[4:12].split(b"\x00", 1)[0]
+        try:
+            return raw_alias.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ZwoError(f"Non-ASCII alias in HID reply: {reply.hex(' ')}") from exc
+
+    async def set_alias(self, alias: str) -> None:
+        """Write an 0..8-character printable ASCII alias to MCU flash (`0d <alias_8>`)."""
+        if len(alias) > _ID_LEN or not (alias.isascii() and alias.isprintable()):
+            raise ValueError(f"alias must be 0..{_ID_LEN} printable ASCII characters, got {alias!r}")
+        await self._send(_CMD_SET_ALIAS + alias.encode("ascii").ljust(_ID_LEN, b"\x00"))
 
     async def clear_error(self) -> None:
         """Send a fire-and-forget command (`01 0f`) to clear latched MCU hardware error state (`0x06`)."""

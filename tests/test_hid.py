@@ -212,7 +212,7 @@ class TestZwoHidDevice(unittest.IsolatedAsyncioTestCase):
 
     async def test_query_rejects_bad_header_and_truncated_reply(self) -> None:
         for label, report in (
-            ("bad_header", bytes(17)),
+            ("bad_header", bytes(16)),
             ("truncated_header_only", b"\x01\x7e\x5a"),
             ("truncated_15_bytes", _dummy_status_report()[:15]),
         ):
@@ -222,7 +222,7 @@ class TestZwoHidDevice(unittest.IsolatedAsyncioTestCase):
                         await dev.get_status()
 
     async def test_query_retries_on_selector_collision_and_raises_after_exhausting_retries(self) -> None:
-        other_reply = b"\x01\x7e\x5a\x04".ljust(17, b"\x00")
+        other_reply = b"\x01\x7e\x5a\x04".ljust(16, b"\x00")
         replies = [other_reply, other_reply, _dummy_status_report(moving=False)]
         with FakeHidBackend(replies=replies) as backend:
             async with await _DummyHidDevice.open(DEV_PATH) as dev:
@@ -246,6 +246,60 @@ class TestZwoHidDevice(unittest.IsolatedAsyncioTestCase):
             async with await _DummyHidDevice.open(DEV_PATH) as dev:
                 with self.assertRaises(ZwoError):
                     await dev.get_firmware_version()
+
+    async def test_get_serial_number_returns_8_byte_hex_and_rejects_short_reply(self) -> None:
+        raw_sn = bytes.fromhex("000f020102000800")
+        for reply_len in (12, 16):
+            reply = (b"\x01\x7e\x5a\x0c" + raw_sn).ljust(reply_len, b"\xaa")
+            with self.subTest(reply_len=reply_len), FakeHidBackend(replies=[reply]) as backend:
+                async with await _DummyHidDevice.open(DEV_PATH) as dev:
+                    self.assertEqual(await dev.get_serial_number(), "000f020102000800")
+                self.assertEqual(backend.sent_reports, [b"\x03\x7e\x5a\x02\x0c".ljust(16, b"\x00")])
+
+        with FakeHidBackend(replies=[b"\x01\x7e\x5a\x0c" + raw_sn[:7]]):
+            async with await _DummyHidDevice.open(DEV_PATH) as dev:
+                with self.assertRaises(ZwoError):
+                    await dev.get_serial_number()
+
+    async def test_get_and_set_alias_validates_and_formats_8_byte_ascii(self) -> None:
+        read_cases = [
+            ("unset_12_bytes", b"\x01\x7e\x5a\x0d" + bytes(8), ""),
+            ("short_12_bytes", b"\x01\x7e\x5a\x0d5v1\x00\x00\x00\x00\x00", "5v1"),
+            ("full_8_chars_16_bytes", (b"\x01\x7e\x5a\x0dABCDEFGH").ljust(16, b"\x00"), "ABCDEFGH"),
+            ("stops_at_first_nul", b"\x01\x7e\x5a\x0d5v1\x00junk", "5v1"),
+        ]
+        for label, reply, expected in read_cases:
+            with self.subTest(case=label), FakeHidBackend(replies=[reply]) as backend:
+                async with await _DummyHidDevice.open(DEV_PATH) as dev:
+                    self.assertEqual(await dev.get_alias(), expected)
+                self.assertEqual(backend.sent_reports, [b"\x03\x7e\x5a\x02\x0d".ljust(16, b"\x00")])
+
+        for bad_label, bad_reply in (
+            ("truncated_11_bytes", b"\x01\x7e\x5a\x0d" + bytes(7)),
+            ("non_ascii_bytes", b"\x01\x7e\x5a\x0d\xff\x00\x00\x00\x00\x00\x00\x00"),
+        ):
+            with self.subTest(bad_reply=bad_label), FakeHidBackend(replies=[bad_reply]):
+                async with await _DummyHidDevice.open(DEV_PATH) as dev:
+                    with self.assertRaises(ZwoError):
+                        await dev.get_alias()
+
+        with FakeHidBackend() as backend:
+            async with await _DummyHidDevice.open(DEV_PATH) as dev:
+                await dev.set_alias("5v1")
+                await dev.set_alias("")
+                await dev.set_alias("12345678")
+                for bad_alias in ("123456789", "a\x00b", "a\nb", "é"):
+                    with self.subTest(bad_alias=bad_alias), self.assertRaises(ValueError):
+                        await dev.set_alias(bad_alias)
+
+            self.assertEqual(
+                backend.sent_reports,
+                [
+                    b"\x03\x7e\x5a\x0d5v1".ljust(16, b"\x00"),
+                    b"\x03\x7e\x5a\x0d".ljust(16, b"\x00"),
+                    b"\x03\x7e\x5a\x0d12345678".ljust(16, b"\x00"),
+                ],
+            )
 
     async def test_clear_error_sends_command(self) -> None:
         with FakeHidBackend() as backend:
