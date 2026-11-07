@@ -135,7 +135,7 @@ class ZwoHidDevice(Generic[_StatusT]):
 
         Uses `os.fsencode(path)` for lossless round-tripping of raw OS `bytes` paths
         and `os.path.realpath()` when `path` is a symlink (such as
-        `/dev/input/by-path/...-hidraw` or a custom `udev` symlink) so it matches the
+        `/dev/hidraw/by-path/<ID_PATH>` or a custom `udev` symlink) so it matches the
         canonical `/dev/hidrawN` path returned by `hid.enumerate()`. Verifying membership
         in `valid_paths` before calling `backend.Device(path=raw_path)` ensures
         non-matching or wrong-class device nodes never open an OS file descriptor.
@@ -180,7 +180,7 @@ class ZwoHidDevice(Generic[_StatusT]):
         """Verify `(VID, PIDS)` and open a persistent OS HID handle at `path`.
 
         Accepts either a direct `/dev/hidrawN` path returned by `await cls.discover()`
-        or a persistent `udev` symlink (e.g. `/dev/input/by-path/...-hidraw`), which is
+        or a persistent `udev` symlink (e.g. `/dev/hidraw/by-path/<ID_PATH>`), which is
         resolved via `os.path.realpath()` before matching against `hid.enumerate()`
         while preserving the caller's `path` on `self.path`.
 
@@ -226,7 +226,7 @@ class ZwoHidDevice(Generic[_StatusT]):
         arbitrary filesystem paths round-trip losslessly when passed to `await cls.open(path)`.
         Note that ZWO USB descriptors do not expose unique USB `iSerial` strings (either
         omitted or generic `"123456"`), so multiple identical devices should be
-        disambiguated via `/dev/input/by-path/...-hidraw`, `get_serial_number()`, or
+        disambiguated via `/dev/hidraw/by-path/<ID_PATH>`, `get_serial_number()`, or
         `get_alias()`.
         """
         return await _run_in_executor(cls._discover_paths)
