@@ -9,31 +9,33 @@
 
 ## Key behaviors & protocol details
 
+- **Single-owner concurrency:** Methods assume one caller per physical device at a time. Concurrent operations across different devices are supported. Executor serialization protects individual HID transactions; it does not make whole controller operations atomic.
 - **Mechanical gearing & firmware coordinate width:**
-  - Output shaft gearing is `5,760` steps per full 360° revolution (16 steps/°; ~341.7 steps/s USB slew rate on `fw 3.1.9`).
+  - On tested standard ZWO EAF hardware (`fw 3.1.9` / `3.2.2`), output shaft gearing is `5,760` steps per full 360° revolution (16 steps/°; ~341.7 steps/s USB slew rate observed on `fw 3.1.9`).
   - `await Eaf.open(path)` is strictly read-only: it queries `get_firmware_version()` (`02 04`) once to set `focuser.firmware_version` and `focuser.step_range` (`60_000` with 16-bit coordinates on `fw <= 3.3.5`, `600_000` with 24-bit coordinates on `fw > 3.3.5`), without overwriting device coordinates or NVRAM settings.
 - **Status & telemetry (`EafStatus`):**
   - `await focuser.get_status()` (`02 03`) returns `EafStatus`:
     - `moving`: `True` while moving via a USB command (`reply[4] == 0x01`) or a physical hand-controller button press (`hand_controller_active`).
     - `step`: Current focuser position in steps (`0..max_step`).
     - `max_step`: Configured maximum step limit (`1..step_range`).
-    - `temperature_c`: Temperature in °C (`(raw - 30_000) / 100.0`), or `None` if out of valid bounds. When the external 3.5 mm probe is plugged in, reports the probe temperature (~23 °C, emitting a brief buzzer beep on plug-in even when `beep=False`); when unplugged, hardware seamlessly falls back to an internal PCB/MCU sensor (~31–35 °C) without changing any flag byte.
+    - `temperature_c`: Temperature in °C (`(raw - 30_000) / 100.0`), or `None` if out of valid bounds. On tested `fw 3.1.9` / `3.2.2` hardware, when the external 3.5 mm probe is plugged in, it reports the probe temperature (~23 °C, emitting a brief buzzer beep on plug-in even when `beep=False`); when unplugged, the hardware falls back to an internal PCB/MCU sensor (~31–35 °C) without changing any flag byte.
     - `backlash`: Configured backlash compensation in steps (`0..255`).
     - `reverse`: `True` if stepper motor direction is reversed (`reply[13] & 0x02`).
     - `beep`: `True` if the motion buzzer is enabled (`reply[13] & 0x01`).
     - `max_force`: Raw 4-bit motor torque / holding force nibble (`reply[13] >> 4`, `0..15`; configurable range via `configure()` is `1..5`).
-    - `hand_controller_active`: `True` while an operator holds the physical IN/OUT button on the 3.5 mm hand controller (`reply[13] & 0x04`). During hand-controller motion, `reply[4]` stays `0x00`, the motor slews at slow (~36.5 steps/s) then fast (~285 steps/s) speed, and the MCU holds the cached temperature reading in `reply[11:13]` until button release.
+    - `hand_controller_active`: `True` while an operator holds the physical IN/OUT button on the 3.5 mm hand controller (`reply[13] & 0x04`). On tested `fw 3.1.9` hardware, during hand-controller motion `reply[4]` stays `0x00`, the motor slews at slow (~36.5 steps/s) then fast (~285 steps/s) speed, and the MCU holds the cached temperature reading in `reply[11:13]` until button release.
 - **State-preserving control (`move`, `stop`, `reset_position`, `configure`):**
-  - Every category-`0x03` command reads a fresh `02 03` status report first and preserves live `backlash`, `speed`/`max_step`, and `flags` bytes (while masking out read-only bit `0x04` from outgoing `tx[13]`) so unspecified NVRAM settings are never overwritten.
-  - **Autonomous torque-stall / forced-stop behavior (`move`):** If mechanical load exceeds the configured `max_force` level (`1..5`), the MCU emits an audible beep (even when `beep=False`), halts the stepper motor autonomously within < 6 ms (1 step) without requiring a host `stop()` command, and transitions `reply[4]` directly from `0x01` (`moving=True`) to `0x00` (`moving=False`) at the stalled coordinate *without* setting `reply[4] = 0x06` (`_STATE_ERROR`). Callers can detect a mechanical stall by checking whether the settled step returned by `await focuser.move(target_step)` differs from `target_step`.
-  - **Stopping (`stop`):** `await focuser.stop(timeout=5.0)` transmits `03 00 ...` (`opcode=0x00`) and returns immediately if already settled, or polls every `200 ms` until settled. Note that USB `stop()` cannot override a physically held hand-controller button until the operator releases it.
-  - **Coordinate reset (`reset_position`) & atomic configuration (`configure`):** `await focuser.reset_position(step)` (`opcode=0x01`) updates the MCU step counter in place without moving the motor. `await focuser.configure(max_step=..., backlash=..., reverse=..., beep=..., max_force=...)` validates bounds (`backlash` `0..255`, `max_force` `1..5`, `max(1, status.step) <= max_step <= step_range`) and applies all specified fields atomically in a single category-`0x03` frame.
+  - Every category-`0x03` command reads a fresh `02 03` status report first and preserves live `backlash`, `speed`/`max_step`, and `flags` bytes (while masking out read-only bit `0x04` from outgoing `tx[13]`) so unspecified NVRAM settings are never overwritten. The initial status query and outgoing control frame are separate HID transactions, and `move()`, `reset_position()`, and `configure()` reject the operation when the initial status reports `moving=True`.
+  - **Polling deadlines & continued hardware motion (`move`, `stop`):** The `timeout` polling deadline starts after the command has been sent, and each requested sleep is capped to the remaining time (`min(0.2, remaining)`). Event-loop scheduling, executor queueing, and blocking HID calls can delay completion (`timeout` is not a hard end-to-end deadline), and a settled final response takes precedence over deadline expiry. Timeout (`TimeoutError`) or task cancellation (`asyncio.CancelledError`) ends host polling without aborting hardware motion on the MCU—call `await focuser.stop()` to halt an active USB move. See [`README.md`](../README.md#how-it-works) for the shared polling deadline contract.
+  - **Incomplete moves & autonomous torque-stall behavior (`move`):** A settled step returned by `await focuser.move(target_step)` that differs from `target_step` indicates an incomplete move, with mechanical torque stall as one possible cause. On tested `fw 3.1.9` / `3.2.2` hardware, if mechanical load exceeds the configured `max_force` level (`1..5`), the MCU emits an audible beep (even when `beep=False`), halts the stepper motor autonomously within a single USB query interval (< 6 ms / 1 step) without requiring a host `stop()` command, and transitions `reply[4]` directly from `0x01` (`moving=True`) to `0x00` (`moving=False`) at the stopped coordinate *without* setting `reply[4] = 0x06` (`_STATE_ERROR`).
+  - **Stopping (`stop`):** After `timeout` validation and a successful status read, `await focuser.stop(timeout=5.0)` transmits a stop command (`03 00 ...`, `opcode=0x00`) preserving live telemetry settings even if already settled, then polls until settled. Note that USB `stop()` cannot override a physically held hand-controller button until the operator releases it.
+  - **Coordinate reset (`reset_position`) & multi-field configuration (`configure`):** `await focuser.reset_position(step)` (`opcode=0x01`) updates the MCU step counter in place without moving the motor. `await focuser.configure(max_step=..., backlash=..., reverse=..., beep=..., max_force=...)` validates bounds (`backlash` `0..255`, `max_force` `1..5`, `max(1, status.step) <= max_step <= step_range`) and applies all specified fields in a single outgoing category-`0x03` frame (this does not form an atomic read-modify-write transaction against other callers or processes). Both `reset_position()` and `configure()` return after sending the command without readback confirmation; call `await focuser.get_status()` to verify the updated state.
 - **EAF Pro telemetry & controls:**
   - `await focuser.get_battery_status()` (`02 1e`, which replies with selector `reply[3] == 0x00` rather than `0x1e`) returns `EafBatteryStatus(percentage, health, temperature_c, voltage_mv, charge_current_ma, discharge_current_ma, charge_voltage_mv)`.
   - `await focuser.get_error_code()` (`02 05`, unpacking `b"E<motor><battery>\x00"` in `reply[4:8]`) returns `(motor_error_code, battery_error_code)` (e.g. `("E0", "E0")`, where motor codes are `"E0"` normal / `"E5"` stall and battery codes are `"E0"` normal / `"E6"` charge over-temp / `"E7"` discharge over-temp / `"E8"` charge under-temp).
-  - `await focuser.get_led_state()` (`02 1f`) / `await focuser.set_led_state(enabled)` (`20 <00|01>`) read and control the EAF Pro status LED.
+  - `await focuser.get_led_state()` (`02 1f`) / `await focuser.set_led_state(enabled)` (`20 <00|01>`) read and control the EAF Pro status LED. `set_led_state()` returns after sending the command without readback confirmation; call `await focuser.get_led_state()` to verify.
 - **Device identity & error recovery (inherited from [`ZwoHidDevice`](../pyzwohid/hid.py)):**
-  - `await focuser.get_firmware_version()` (`02 04`), `await focuser.get_serial_number()` (`02 0c`), `await focuser.get_alias()` (`02 0d`), `await focuser.set_alias(alias)` (`0d <alias_8>`), and `await focuser.clear_error()` (`01 0f`).
+  - `await focuser.get_firmware_version()` (`02 04`), `await focuser.get_serial_number()` (`02 0c`), `await focuser.get_alias()` (`02 0d`), `await focuser.set_alias(alias)` (`0d <alias_8>`), and `await focuser.clear_error()` (`01 0f`). `set_alias()` and `clear_error()` return after sending the command without readback confirmation; call `await focuser.get_alias()` or `await focuser.get_status()` to verify.
 
 ## Usage
 
@@ -51,7 +53,11 @@ async def main() -> None:
         status = await focuser.get_status()
         print(f"EAF (fw {focuser.firmware_version}, range {focuser.step_range}): {status}")
 
-        settled_step = await focuser.move(status.step + 100, timeout=60.0)
+        await focuser.configure(backlash=10, beep=False)
+        verified = await focuser.get_status()
+        print(f"Configured backlash={verified.backlash}, beep={verified.beep}")
+
+        settled_step = await focuser.move(verified.step + 100, timeout=60.0)
         print(f"Settled at step {settled_step}")
 
 

@@ -8,6 +8,7 @@
 
 - [Philosophy](#philosophy)
 - [Prerequisites](#prerequisites)
+- [Installation](#installation)
 - [How it works](#how-it-works)
 - [Device Guides](#device-guides)
   - [ZWO Electronic Filter Wheels (`Efw`, `EfwStatus`)](docs/efw.md)
@@ -28,8 +29,16 @@ Every implemented module uses the device family's native USB protocol rather tha
 
 ## Prerequisites
 
-- **Python `>= 3.11`**
+- **Python `>= 3.11`** and **`git`** (for installing from Git)
 - **System `libhidapi` shared library** (loaded at runtime by the Python `hid` package; e.g. `libhidapi-hidraw0` on openSUSE and Debian/Ubuntu, or `hidapi` on Fedora/RHEL) and non-root device permissions—see the [Linux setup guide](docs/linux.md) for `libhidapi` and `udev` installation.
+
+## Installation
+
+Install `pyzwohid` inside a virtual environment directly from Git (`git` is required):
+
+```bash
+python -m pip install 'git+https://github.com/ms6107/pyzwohid.git@0.2.1'
+```
 
 ## How it works
 
@@ -37,8 +46,13 @@ Every implemented module uses the device family's native USB protocol rather tha
 
 - **Path-addressed, valid-by-construction handle:** `await Efw.open(path)` and `await Eaf.open(path)` verify the USB `(VID, PID)` and open the OS HID device node (discovered via `await Efw.discover()` / `await Eaf.discover()` or a persistent `udev` symlink such as `/dev/hidraw/by-path/<ID_PATH>`), holding the handle open until `await close()` (or `async with` exit).
 - **Shared device operations (`ZwoHidDevice`):** Every controller inherits `get_firmware_version()` (`02 04`), `get_serial_number()` (`02 0c`), `get_alias()` (`02 0d`), `set_alias(alias)` (`0d <alias_8>`), `clear_error()` (`01 0f`), and `get_status()`.
-- **Single-worker HID executor:** All `hidapi` C calls (`discover`, `open`, `close`, `_send`, `_query`) are dispatched onto a single shared `ThreadPoolExecutor(max_workers=1)` so `hidapi` operations never race on process-global state or on an open `hid_device` handle, while lightweight (~3–6 ms) feature-report transactions across multiple ZWO HID devices interleave cleanly between `asyncio.sleep(0.2)` polling intervals.
-- **Polling deadlines vs. blocking USB I/O:** The `timeout` argument on motion and calibration methods is a **Python-level monotonic polling deadline** checked between status queries, raising built-in `TimeoutError` if the device does not settle in time.
+- **Single-owner concurrency & single-worker HID executor:** Methods assume one caller per physical device at a time. Concurrent operations across different devices are supported. All `hidapi` C calls (`discover`, `open`, `close`, `_send`, `_query`) are dispatched onto a single shared `ThreadPoolExecutor(max_workers=1)` so `hidapi` operations never race on process-global state or on an open `hid_device` handle, while lightweight (~3–6 ms) feature-report transactions across multiple ZWO HID devices interleave cleanly between `asyncio.sleep(0.2)` polling intervals. Executor serialization protects individual HID transactions; it does not make whole controller operations atomic.
+- **Polling deadlines vs. blocking USB I/O:** On motion and calibration methods (`Efw.move_to_slot`, `Efw.calibrate`, `Eaf.move`, `Eaf.stop`), the `timeout` argument is a Python-level monotonic polling deadline:
+  - The polling deadline starts after the outgoing command has been sent.
+  - Each requested sleep between status polls is capped to the remaining time (`min(0.2, remaining)`).
+  - Event-loop scheduling, executor queueing, and blocking HID calls can delay completion; `timeout` is not a hard end-to-end deadline.
+  - A settled final response takes precedence over deadline expiry (if a status query completes with `moving=False`, the settled status is returned even if the deadline expired while that query was in flight).
+  - Timeout (`TimeoutError`) or task cancellation (`asyncio.CancelledError`) ends host polling; it does not abort hardware motion on the MCU.
 
 ## Device Guides
 

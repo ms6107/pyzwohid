@@ -54,6 +54,10 @@ class Efw(ZwoHidDevice[EfwStatus]):
     physical wheel numbering and the HID wire protocol. Total `slot_count` (`5`, `7`,
     `8`, etc.) is read dynamically from each `02 01` status report rather than
     hardcoded by model.
+
+    Methods assume one caller per physical device at a time. Concurrent operations
+    across different devices are supported. Executor serialization protects
+    individual HID transactions; it does not make whole controller operations atomic.
     """
 
     PIDS = (0x1F01, 0x1F02)
@@ -72,8 +76,8 @@ class Efw(ZwoHidDevice[EfwStatus]):
           `EfwStatus(moving=True, slot_count=-1, slot=-1)` *before* checking
           `1 <= slot_count <= 16`. During power-on or `calibrate()`, `reply[9]` is not
           the total slot count—it is a live Hall-sensor magnet counter incrementing
-          `0/1 -> 2 -> ... -> slot_count` (~2.87 s/slot on `fw 3.0.6`), while
-          `reply[6:9]` remains frozen at `(0, 0, 0)` or the pre-calibration slot
+          `0/1 -> 2 -> ... -> slot_count` (~2.87 s/slot observed on 7-slot `fw 3.0.6`),
+          while `reply[6:9]` remains frozen at `(0, 0, 0)` or the pre-calibration slot
           `(K, K, K)` until the final homing step onto slot `1`.
         - **Settled detection (`state == 0x01` and `target_slot == prev_slot == next_slot`):**
           `(prev_slot, next_slot)` in `reply[7:9]` bounds the current carousel position:
@@ -82,12 +86,12 @@ class Efw(ZwoHidDevice[EfwStatus]):
           independent of CW/CCW rotation direction). Both `state == 0x01` and
           `target_slot == prev_slot == next_slot` (`1..slot_count`) are required:
           1. *Fine settling / damping (`state == 0x04`, `slots == (N, N, N)`):* when
-             arriving at target slot `N`, `reply[6:9]` reaches `(N, N, N)` ~250–320 ms
-             *before* `state` transitions from `0x04` (moving) to `0x01` (settled) while
+             arriving at target slot `N`, `reply[6:9]` reaches `(N, N, N)` (~250–320 ms
+             before `state` transitions from `0x04` to `0x01` on tested `fw 3.0.6`) while
              the stepper motor completes fine centering.
           2. *Inter-command handoff (`state == 0x01`, `slots == (new_target, old_slot, old_slot)`):*
              if a second move was buffered in the MCU's 1-deep move queue, `state`
-             briefly pulses `0x01` for ~100 ms at `old_slot` with
+             briefly pulses `0x01` (~100 ms on tested `fw 3.0.6`) at `old_slot` with
              `target_slot == new_target != prev_slot` before resuming `0x04`.
         """
         reply = await self._query(_CMD_GET_STATUS)
@@ -122,29 +126,34 @@ class Efw(ZwoHidDevice[EfwStatus]):
         Sends `01 <02|03> <slot>` (`0x02` = bidirectional shortest-path CW/CCW,
         `0x03` = unidirectional forward-only CW):
 
-        - **Rejected while moving:** Although the EFW MCU has a 1-deep move queue,
-          sending a bidirectional move (`01 02 <slot_B>`) mid-flight while rotating
-          toward `<slot_A>` causes the MCU to compute the CW/CCW shortest path for
-          `<slot_B>` against its *instantaneous in-flight carousel position* at packet
-          arrival rather than against `<slot_A>`, making the subsequent move take the
-          long way around. `move_to_slot()` therefore requires `status.moving` to be
-          `False` before issuing a move.
+        - **Rejected when initial status reports moving:** Rejects motion when the
+          initial `get_status()` query reports `moving=True` (note that the initial
+          status query and move command send are separate HID transactions). Although
+          the EFW MCU has a 1-deep move queue, sending a bidirectional move
+          (`01 02 <slot_B>`) mid-flight while rotating toward `<slot_A>` causes the MCU
+          to compute the CW/CCW shortest path for `<slot_B>` against its *instantaneous
+          in-flight carousel position* at packet arrival rather than against `<slot_A>`,
+          making the subsequent move take the long way around.
         - **Per-command direction byte:** `unidirectional` is encoded per move in
           `tx[4]` (`0x03` vs `0x02`) and is never written to NVRAM. Single-command
           `(slot_count - 1)` unidirectional moves execute natively in one continuous
           sweep.
         - **Same-slot no-op:** Moving to the already settled slot (`slot == status.slot`)
           is accepted by the MCU as an immediate no-op.
-        - **No hardware abort:** The EFW wire protocol has no stop command; once
-          `01 <02|03> <slot>` is sent, the MCU completes the rotation autonomously even
-          if `move_to_slot()` raises `TimeoutError` or is cancelled.
+        - **Polling deadline & no hardware abort:** The `timeout` deadline starts after
+          the move command has been sent; each requested sleep is capped to the
+          remaining time, a settled final response takes precedence over deadline
+          expiry, and event-loop scheduling, executor queueing, and blocking HID calls
+          can delay completion (`timeout` is not a hard end-to-end deadline). Timeout or
+          cancellation ends host polling only; the EFW wire protocol has no stop
+          command, so the MCU completes the rotation autonomously.
 
         Raises:
             ValueError: If `timeout <= 0`, `timeout` is non-finite, or `slot` is outside
                 `[1, status.slot_count]`.
-            ZwoError: If the wheel is already moving/calibrating or a HID/hardware
+            ZwoError: If the initial status reports moving/calibrating or a HID/hardware
                 fault occurs.
-            TimeoutError: If the wheel does not settle within `timeout` seconds.
+            TimeoutError: If the wheel does not settle before `timeout` expires.
         """
         _validate_timeout(timeout)
 
@@ -161,7 +170,8 @@ class Efw(ZwoHidDevice[EfwStatus]):
     async def calibrate(self, timeout: float = 60.0) -> int:
         """Run a full Hall-sensor calibration sweep (`01 01`), poll until settled, and return the settled slot (`1`).
 
-        Executes a 3-phase sweep (~27.7–30.6 s on a 7-slot wheel):
+        Rejects calibration when the initial `get_status()` query reports `moving=True`.
+        Executes a 3-phase sweep (~27.7–30.6 s observed on a 7-slot wheel, `fw 3.0.6`):
         1. Rotates to locate the Hall-sensor index reference.
         2. Completes a full revolution under `state == 0x00`
            (`EfwStatus(moving=True, slot_count=-1, slot=-1)`), counting magnets
@@ -169,11 +179,16 @@ class Efw(ZwoHidDevice[EfwStatus]):
         3. Homes with fine damping (`state == 0x04 -> 0x01`) onto **slot `1`**
            regardless of which slot was selected before calibration.
 
+        The `timeout` deadline starts after `01 01` is sent; each requested sleep is
+        capped to the remaining time, a settled final response takes precedence over
+        deadline expiry, and timeout or cancellation ends host polling without aborting
+        the MCU calibration sweep.
+
         Raises:
             ValueError: If `timeout <= 0` or `timeout` is non-finite.
-            ZwoError: If the wheel is already moving/calibrating or a HID/hardware
+            ZwoError: If the initial status reports moving/calibrating or a HID/hardware
                 fault occurs.
-            TimeoutError: If calibration does not settle within `timeout` seconds.
+            TimeoutError: If calibration does not settle before `timeout` expires.
         """
         _validate_timeout(timeout)
 

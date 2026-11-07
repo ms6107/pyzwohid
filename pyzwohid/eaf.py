@@ -67,9 +67,10 @@ class EafStatus(ZwoHidStatus):
         max_step: Configured maximum step limit (`1..step_range`).
         temperature_c: Temperature in degrees Celsius (`(raw - 30_000) / 100.0`), or
             `None` if the raw word is out of valid bounds (`<= 10_000` or `0xFFFF`).
-            When the external 3.5 mm probe is plugged in, reports the probe
-            temperature; when unplugged, hardware seamlessly falls back to an
-            internal MCU/PCB temperature sensor without changing any flag byte.
+            On tested EAF hardware (`fw 3.1.9` / `3.2.2`), reports the external
+            3.5 mm probe temperature when plugged in and seamlessly falls back to an
+            internal MCU/PCB temperature sensor when unplugged without changing any
+            flag byte.
         backlash: Configured backlash compensation in steps (`0..255`).
         reverse: True if stepper motor direction is reversed (`reply[13] & 0x02`).
         beep: True if the motion buzzer is enabled (`reply[13] & 0x01`).
@@ -77,7 +78,7 @@ class EafStatus(ZwoHidStatus):
             `0..15`; configurable range via `configure()` is `1..5`).
         hand_controller_active: True while a physical IN/OUT button on the 3.5 mm
             hand controller is actively moving the focuser (`reply[13] & 0x04`),
-            during which `reply[4]` remains `0x00`.
+            during which `reply[4]` remains `0x00` (observed on `fw 3.1.9`).
     """
 
     step: int
@@ -117,8 +118,9 @@ class EafBatteryStatus:
 class Eaf(ZwoHidDevice[EafStatus]):
     """Asynchronous ZWO EAF focuser controller (`03c3:1f10`).
 
-    Mechanical gearing is 5,760 steps per full 360° output shaft revolution
-    (16 steps/°; ~341.7 steps/s USB slew rate on `fw 3.1.9`).
+    On tested standard EAF hardware (`fw 3.1.9` / `3.2.2`), mechanical gearing is
+    5,760 steps per full 360° output shaft revolution (16 steps/°; ~341.7 steps/s
+    USB slew rate observed on `fw 3.1.9`).
 
     `await Eaf.open(path)` queries `get_firmware_version()` (`02 04`) once to set
     `firmware_version` and `step_range` (`60_000` with 16-bit coordinates on
@@ -127,6 +129,10 @@ class Eaf(ZwoHidDevice[EafStatus]):
     `02 03` status report first and echo the focuser's live `backlash`, `speed`/`max_step`,
     and `flags` bytes (while masking out read-only bit `0x04`) so unspecified NVRAM
     settings are never overwritten.
+
+    Methods assume one caller per physical device at a time. Concurrent operations
+    across different devices are supported. Executor serialization protects
+    individual HID transactions; it does not make whole controller operations atomic.
     """
 
     PIDS = (0x1F10,)
@@ -213,16 +219,17 @@ class Eaf(ZwoHidDevice[EafStatus]):
           `reply[8:10]` is 16-bit `step`, and `reply[14:16]` is 16-bit `max_step`. On
           `fw > 3.3.5`, `reply[6]` is `max_step` bits `16..23`, `reply[7:10]` is 24-bit
           `step`, and `reply[14:16]` is `max_step` bits `0..15`.
-        - **Hand-controller motion (`reply[13] & 0x04`):** While an operator presses the
-          physical IN/OUT buttons on the 3.5 mm hand controller, `reply[4]` (`state`)
-          stays `0x00` (`_STATE_SETTLED`) and only bit `0x04` of `reply[13]` asserts
-          (`hand_controller_active=True`), slewing at slow (~36.5 steps/s) then fast
-          (~285 steps/s) speed and holding the cached `raw_temp` word in `reply[11:13]`
-          until button release. `EafStatus.moving` is `True` when either
-          `reply[4] == 0x01` or `hand_controller_active` is `True`.
+        - **Hand-controller motion (`reply[13] & 0x04`):** On tested hardware
+          (`fw 3.1.9`), while an operator presses the physical IN/OUT buttons on the
+          3.5 mm hand controller, `reply[4]` (`state`) stays `0x00` (`_STATE_SETTLED`)
+          and only bit `0x04` of `reply[13]` asserts (`hand_controller_active=True`),
+          slewing at slow (~36.5 steps/s) then fast (~285 steps/s) speed and holding
+          the cached `raw_temp` word in `reply[11:13]` until button release.
+          `EafStatus.moving` is `True` when either `reply[4] == 0x01` or
+          `hand_controller_active` is `True`.
         - **Temperature fallback (`reply[11:13]`):** Decoded as
           `(raw_temp - 30_000) / 100.0` °C when `10_000 < raw_temp < 0xFFFF` (or `None`
-          otherwise). On physical EAF hardware (`fw 3.1.9` / `3.2.2`), unplugging the
+          otherwise). On tested EAF hardware (`fw 3.1.9` / `3.2.2`), unplugging the
           external 3.5 mm probe does not produce `None`—the MCU seamlessly reports its
           internal PCB/MCU sensor (~31–35 °C) and switches back to the external probe
           (~23 °C, with a brief buzzer beep even if `beep=False`) when plugged in,
@@ -308,7 +315,8 @@ class Eaf(ZwoHidDevice[EafStatus]):
 
         Uses category byte `0x20` in `tx[3]` (`03 7e 5a 20 <00|01>`), whereas reading
         the LED uses `02 1f` (category `0x1f` in `tx[3]` is the EAF Pro shipping-mode
-        power-down command).
+        power-down command). Returns after sending the command, without readback
+        confirmation (call `await get_led_state()` to verify).
         """
         await self._send(bytes((_CMD_SET_LED_STATE, 1 if enabled else 0)))
 
@@ -352,24 +360,36 @@ class Eaf(ZwoHidDevice[EafStatus]):
     async def move(self, step: int, *, timeout: float = 60.0) -> int:
         """Move to `step` (`0..max_step`), poll every 200 ms until settled, and return the settled step.
 
-        Reads a fresh `02 03` status report first to reject concurrent motion, validate
-        `0 <= step <= status.max_step`, and preserve live `backlash`, `speed`, `flags`,
-        and `max_step` in the outgoing `03 01 ...` (`opcode=0x00`) control frame.
+        Reads a fresh `02 03` status report first to reject motion when the initial
+        status reports `moving=True` (the initial status query and move command send
+        are separate HID transactions), validate `0 <= step <= status.max_step`, and
+        preserve live `backlash`, `speed`, `flags`, and `max_step` in the outgoing
+        `03 01 ...` (`opcode=0x00`) control frame.
 
-        **Autonomous torque-stall / forced-stop behavior:** If mechanical load exceeds
-        the configured `max_force` level (`1..5`), the MCU emits an audible buzzer beep
-        (even when `beep=False`), halts the stepper motor autonomously within < 6 ms
-        (1 step) without requiring a host `stop()` command, and transitions `reply[4]`
-        directly from `0x01` (`moving=True`) to `0x00` (`moving=False`) at the stalled
-        coordinate *without* setting `reply[4] = 0x06` (`_STATE_ERROR`). Callers can
-        detect a mechanical stall by checking whether the returned settled step differs
-        from the requested `step`.
+        - **Polling deadline & continued hardware motion:** The `timeout` deadline
+          starts after the move command has been sent; each requested sleep is capped to
+          the remaining time, a settled final response takes precedence over deadline
+          expiry, and event-loop scheduling, executor queueing, and blocking HID calls
+          can delay completion (`timeout` is not a hard end-to-end deadline). Timeout or
+          cancellation ends host polling only; it does not abort MCU motion on hardware
+          (call `await stop()` to halt an active USB move).
+        - **Incomplete moves & hardware torque-stall observations:** A returned settled
+          position differing from `step` indicates an incomplete move (for example due
+          to a mechanical torque stall or external stop). On tested EAF hardware
+          (`fw 3.1.9` / `3.2.2`), when mechanical load exceeded the configured
+          `max_force` level (`1..5`), the MCU emitted an audible buzzer beep (even when
+          `beep=False`), halted the stepper motor autonomously within 1 step (observed
+          within a single ~6 ms USB query interval) without requiring a host `stop()`
+          command, and transitioned `reply[4]` directly from `0x01` (`moving=True`) to
+          `0x00` (`moving=False`) at the stopped coordinate *without* setting
+          `reply[4] = 0x06` (`_STATE_ERROR`).
 
         Raises:
             ValueError: If `timeout <= 0`, `timeout` is non-finite, or `step` is outside
                 `[0, status.max_step]`.
-            ZwoError: If the focuser is already moving or a HID/hardware fault occurs.
-            TimeoutError: If the focuser does not settle within `timeout` seconds.
+            ZwoError: If the initial status reports moving or a HID/hardware fault
+                occurs.
+            TimeoutError: If the focuser does not settle before `timeout` expires.
         """
         _validate_timeout(timeout)
 
@@ -385,18 +405,20 @@ class Eaf(ZwoHidDevice[EafStatus]):
     async def stop(self, *, timeout: float = 5.0) -> int:
         """Send a stop command (`03 00 ...`, `opcode=0x00`), poll until settled, and return the settled step.
 
-        Unconditionally transmits the `03 00 ...` stop control frame preserving live
-        telemetry settings. If the initial `02 03` status read already reported
-        `moving=False`, returns `status.step` immediately without sleeping; otherwise
-        polls every 200 ms until `moving` becomes `False`. Note that if `moving` is
-        `True` because an operator is physically holding a hand-controller button
+        After timeout validation and a successful status read, transmits a stop command
+        (`03 00 ...`, `opcode=0x00`) preserving live telemetry settings even if already
+        settled. If that initial `02 03` status read reported `moving=False`, returns
+        `status.step` immediately without sleeping; otherwise polls every 200 ms until
+        `moving` becomes `False` (subject to the same polling deadline semantics as
+        `move()`). On tested hardware (`fw 3.1.9`), if `moving` is `True` because an
+        operator is physically holding a hand-controller button
         (`hand_controller_active=True`), USB `stop()` cannot override the physical
         button press until it is released.
 
         Raises:
             ValueError: If `timeout <= 0` or `timeout` is non-finite.
             ZwoError: If a HID or hardware fault occurs.
-            TimeoutError: If the focuser does not settle within `timeout` seconds.
+            TimeoutError: If the focuser does not settle before `timeout` expires.
         """
         _validate_timeout(timeout)
 
@@ -411,13 +433,17 @@ class Eaf(ZwoHidDevice[EafStatus]):
     async def reset_position(self, step: int) -> None:
         """Overwrite the current focuser step coordinate (`0..max_step`) in the MCU without moving.
 
-        Sends a category-`0x03` control report with `run=0x00` and `opcode=0x01`
+        Rejects the operation when the initial status reports `moving=True`. Sends a
+        category-`0x03` control report with `run=0x00` and `opcode=0x01`
         (`_OPCODE_RESET_POSITION`), updating the MCU's step counter in place while
-        preserving live `backlash`, `speed`, `flags`, and `max_step`.
+        preserving live `backlash`, `speed`, `flags`, and `max_step`. Returns after
+        sending the command, without readback confirmation (call `await get_status()`
+        to verify `status.step`).
 
         Raises:
             ValueError: If `step` is outside `[0, status.max_step]`.
-            ZwoError: If the focuser is currently moving or a HID/hardware fault occurs.
+            ZwoError: If the initial status reports moving or a HID/hardware fault
+                occurs.
         """
         status, reply = await self._read_status_report()
         if status.moving:
@@ -436,19 +462,26 @@ class Eaf(ZwoHidDevice[EafStatus]):
         beep: bool | None = None,
         max_force: int | None = None,
     ) -> None:
-        """Update one or more EAF configuration settings atomically while preserving unspecified fields.
+        """Update one or more EAF configuration settings in a single outgoing control frame.
 
-        Reads a fresh `02 03` status report, merges the requested updates into the live
-        telemetry bytes, and sends a single category-`0x03` control report with
+        Reads a fresh `02 03` status report (rejecting if `status.moving` is `True`),
+        merges the requested updates into the live telemetry bytes while preserving
+        unspecified fields, and sends a single category-`0x03` control report with
         `run=0x00` and `opcode=0x02` (`_OPCODE_SET_MAX_STEP`) when `max_step` is
-        specified or `opcode=0x00` (`_OPCODE_MOVE_OR_STOP`) otherwise. On EAF firmware,
-        a single `run=0x00, opcode=0x02` report applies `max_step`, `backlash` (`tx[5]`),
-        and `flags` (`tx[13]`: `beep`, `reverse`, `max_force`) simultaneously.
+        specified or `opcode=0x00` (`_OPCODE_MOVE_OR_STOP`) otherwise. On tested EAF
+        firmware (`fw 3.1.9`), a single `run=0x00, opcode=0x02` report applies
+        `max_step`, `backlash` (`tx[5]`), and `flags` (`tx[13]`: `beep`, `reverse`,
+        `max_force`) in one outgoing frame. Note that the initial status read and
+        control-frame send are separate HID transactions (not an atomic read-modify-write
+        against concurrent callers or processes), and `configure()` returns after
+        sending the command without readback confirmation (call `await get_status()` to
+        verify the updated fields).
 
         Raises:
             ValueError: If `backlash` is outside `[0, 255]`, `max_force` is outside
                 `[1, 5]`, or `max_step` is outside `[max(1, status.step), self.step_range]`.
-            ZwoError: If the focuser is currently moving or a HID/hardware fault occurs.
+            ZwoError: If the initial status reports moving or a HID/hardware fault
+                occurs.
         """
         if backlash is not None and not (0 <= backlash <= 255):
             raise ValueError(f"backlash={backlash} outside allowed range [0, 255]")

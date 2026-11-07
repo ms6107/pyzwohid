@@ -111,8 +111,10 @@ class ZwoHidDevice(Generic[_StatusT]):
     All `hidapi` C calls are serialized on `_EXECUTOR` (1 worker thread) so
     `hidapi` global state and open `hid_device` handles never race across threads,
     while fast (~3-6 ms) USB transactions across multiple devices interleave
-    between `asyncio.sleep(0.2)` polling intervals. Methods on a given device
-    instance assume a single caller per physical device at a time.
+    between `asyncio.sleep(0.2)` polling intervals. Methods assume one caller per
+    physical device at a time. Concurrent operations across different devices are
+    supported. Executor serialization protects individual HID transactions; it does
+    not make whole controller operations atomic.
     """
 
     VID = 0x03C3
@@ -197,10 +199,10 @@ class ZwoHidDevice(Generic[_StatusT]):
     async def close(self) -> None:
         """Close the persistent OS HID device handle.
 
-        Shielded with `asyncio.shield()` so task cancellation during `async with` exit
-        still waits for `_EXECUTOR` to release the OS file descriptor cleanly. Closing
-        the host handle sends no USB packet to the MCU; any motion already in progress
-        on the hardware continues autonomously until settled.
+        Cancellation of the caller does not cancel the scheduled close; cleanup may
+        complete after the caller receives `CancelledError`. Closing the host handle
+        sends no USB packet to the MCU; any motion already in progress on the hardware
+        continues autonomously until settled.
         """
         await asyncio.shield(_run_in_executor(self._close_device))
 
@@ -360,8 +362,10 @@ class ZwoHidDevice(Generic[_StatusT]):
         Whereas `get_alias()` sends category `0x02` selector `0x0d` (`03 7e 5a 02 0d`),
         `set_alias()` places `0x0d` directly in category byte `tx[3]`
         (`03 7e 5a 0d <c0..c7> 00 00 00 00`) so all 8 ASCII bytes fit in `tx[4:12]`.
-        Passing `""` clears the stored alias (`8` zero bytes). Because this command
-        writes directly to non-volatile MCU flash, avoid calling it in tight loops.
+        Passing `""` clears the stored alias (`8` zero bytes). Returns after sending
+        the command, without readback confirmation (call `await get_alias()` to verify
+        the stored value). Because this command writes directly to non-volatile MCU
+        flash, avoid calling it in tight loops.
 
         Raises:
             ValueError: If `alias` exceeds 8 characters or contains non-ASCII /
@@ -377,7 +381,8 @@ class ZwoHidDevice(Generic[_StatusT]):
 
         Unlatches hardware fault state (`state == 0x06`, such as an EFW Hall-sensor
         timeout / motor stall or EAF fault) in the MCU without requiring a USB replug
-        or power cycle.
+        or power cycle. Returns after sending the command, without readback
+        confirmation (call `await get_status()` to verify the cleared state).
         """
         await self._send(_CMD_CLEAR_ERROR)
 
@@ -388,11 +393,15 @@ class ZwoHidDevice(Generic[_StatusT]):
     async def _wait_until_settled(self, timeout: float, operation: str) -> _StatusT:
         """Poll `get_status()` every 200 ms until `status.moving` is `False` or `timeout` expires.
 
-        Sleeps `min(0.2, remaining)` seconds before each status poll so short timeouts
-        never oversleep. If the final USB `get_status()` transfer waking at `deadline`
-        completes a few milliseconds after `deadline` and reports `moving=False`, the
-        settled status is returned rather than raising `TimeoutError`. Note that raising
-        `TimeoutError` stops host polling only and does not abort MCU motion on hardware.
+        - The polling deadline starts when `_wait_until_settled()` is entered (after
+          the motion or calibration command has been sent).
+        - Each requested sleep is capped to the remaining time (`min(0.2, remaining)`).
+        - Event-loop scheduling, executor queueing, and blocking HID calls can delay
+          completion; `timeout` is not a hard end-to-end deadline.
+        - A settled final response (`moving=False`) takes precedence over deadline
+          expiry.
+        - Timeout or task cancellation ends host polling; it does not abort hardware
+          motion on the MCU.
         """
         deadline = monotonic() + timeout
         while True:
