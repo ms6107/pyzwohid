@@ -17,7 +17,7 @@ import struct
 from dataclasses import dataclass
 from typing import Any, Self
 
-from .hid import ZwoError, ZwoHidDevice, ZwoHidStatus, _validate_timeout
+from .hid import ZwoBusyError, ZwoError, ZwoHidDevice, ZwoHidStatus, _validate_timeout
 
 # Coordinate-width split (fw <= 3.3.5 vs fw > 3.3.5)
 _LEGACY_FW_LIMIT = (3, 3, 5)
@@ -387,15 +387,15 @@ class Eaf(ZwoHidDevice[EafStatus]):
         Raises:
             ValueError: If `timeout <= 0`, `timeout` is non-finite, or `step` is outside
                 `[0, status.max_step]`.
-            ZwoError: If the initial status reports moving or a HID/hardware fault
-                occurs.
+            ZwoBusyError: If the initial status reports moving.
+            ZwoError: If a HID or hardware fault occurs.
             TimeoutError: If the focuser does not settle before `timeout` expires.
         """
         _validate_timeout(timeout)
 
         status, reply = await self._read_status_report()
         if status.moving:
-            raise ZwoError("EAF is already moving")
+            raise ZwoBusyError("EAF is already moving")
         if not (0 <= step <= status.max_step):
             raise ValueError(f"step={step} outside allowed range [0, {status.max_step}]")
 
@@ -442,12 +442,12 @@ class Eaf(ZwoHidDevice[EafStatus]):
 
         Raises:
             ValueError: If `step` is outside `[0, status.max_step]`.
-            ZwoError: If the initial status reports moving or a HID/hardware fault
-                occurs.
+            ZwoBusyError: If the initial status reports moving.
+            ZwoError: If a HID or hardware fault occurs.
         """
         status, reply = await self._read_status_report()
         if status.moving:
-            raise ZwoError("EAF is already moving")
+            raise ZwoBusyError("EAF is already moving")
         if not (0 <= step <= status.max_step):
             raise ValueError(f"step={step} outside allowed range [0, {status.max_step}]")
 
@@ -480,8 +480,8 @@ class Eaf(ZwoHidDevice[EafStatus]):
         Raises:
             ValueError: If `backlash` is outside `[0, 255]`, `max_force` is outside
                 `[1, 5]`, or `max_step` is outside `[max(1, status.step), self.step_range]`.
-            ZwoError: If the initial status reports moving or a HID/hardware fault
-                occurs.
+            ZwoBusyError: If the initial status reports moving.
+            ZwoError: If a HID or hardware fault occurs.
         """
         if backlash is not None and not (0 <= backlash <= 255):
             raise ValueError(f"backlash={backlash} outside allowed range [0, 255]")
@@ -490,7 +490,7 @@ class Eaf(ZwoHidDevice[EafStatus]):
 
         status, reply = await self._read_status_report()
         if status.moving:
-            raise ZwoError("EAF is already moving")
+            raise ZwoBusyError("EAF is already moving")
         if max_step is not None:
             min_max_step = max(1, status.step)
             if not (min_max_step <= max_step <= self.step_range):

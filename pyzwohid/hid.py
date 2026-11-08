@@ -72,6 +72,10 @@ class ZwoError(Exception):
     """Base exception for ZWO USB HID I/O failures, hardware faults, or wire-protocol errors."""
 
 
+class ZwoBusyError(ZwoError):
+    """Error raised when a motion or configuration command is rejected because the device is already moving."""
+
+
 class ZwoDevicePathError(ZwoError):
     """Error raised by `open(path)` when `path` does not match an enumerated device for the class `(VID, PIDS)`."""
 

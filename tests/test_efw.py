@@ -11,7 +11,7 @@ import math
 import unittest
 from unittest.mock import patch
 
-from pyzwohid import Efw, EfwStatus, ZwoDevicePathError, ZwoError
+from pyzwohid import Efw, EfwStatus, ZwoBusyError, ZwoDevicePathError, ZwoError
 from tests.test_hid import FakeHidBackend
 
 DEV_PATH = "/dev/hidraw10"
@@ -132,9 +132,9 @@ class TestEfw(unittest.IsolatedAsyncioTestCase):
         for label, report in busy_reports:
             with self.subTest(case=label), FakeEfwHidBackend(replies=[report]) as backend:
                 async with await Efw.open(DEV_PATH) as wheel:
-                    with self.assertRaises(ZwoError):
+                    with self.assertRaises(ZwoBusyError):
                         await wheel.move_to_slot(5)
-                    with self.assertRaises(ZwoError):
+                    with self.assertRaises(ZwoBusyError):
                         await wheel.calibrate()
                 self.assertEqual(len(backend.sent_reports), 2)
 

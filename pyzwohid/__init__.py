@@ -9,7 +9,7 @@ Provides path-based asynchronous controllers for ZWO USB HID devices over `hid`
 (`hidapi`) without proprietary C/C++ vendor shared libraries:
 
 - **Base transport (`pyzwohid.hid`):** `ZwoHidDevice`, `ZwoHidStatus`, `ZwoError`,
-  `ZwoDevicePathError`, and `ZwoQueryCollisionError`.
+  `ZwoBusyError`, `ZwoDevicePathError`, and `ZwoQueryCollisionError`.
 - **Electronic Filter Wheels (`pyzwohid.efw`):** `Efw` and `EfwStatus`.
 - **Electronic Automatic Focusers (`pyzwohid.eaf`):** `Eaf`, `EafStatus`, and
   `EafBatteryStatus`.
@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from .eaf import Eaf, EafBatteryStatus, EafStatus
 from .efw import Efw, EfwStatus
-from .hid import ZwoDevicePathError, ZwoError, ZwoHidDevice, ZwoHidStatus, ZwoQueryCollisionError
+from .hid import ZwoBusyError, ZwoDevicePathError, ZwoError, ZwoHidDevice, ZwoHidStatus, ZwoQueryCollisionError
 
 __all__ = [
     "Eaf",
@@ -27,6 +27,7 @@ __all__ = [
     "EafStatus",
     "Efw",
     "EfwStatus",
+    "ZwoBusyError",
     "ZwoDevicePathError",
     "ZwoError",
     "ZwoHidDevice",

@@ -15,7 +15,7 @@ import unittest
 from typing import Any
 from unittest.mock import patch
 
-from pyzwohid import Eaf, EafBatteryStatus, EafStatus, ZwoDevicePathError, ZwoError
+from pyzwohid import Eaf, EafBatteryStatus, EafStatus, ZwoBusyError, ZwoDevicePathError, ZwoError
 from tests.test_hid import FakeHidBackend, _firmware_report
 
 DEV_PATH = "/dev/hidraw14"
@@ -517,7 +517,7 @@ class TestEaf(unittest.IsolatedAsyncioTestCase):
             ]
         ) as backend:
             async with await Eaf.open(DEV_PATH) as focuser:
-                with self.assertRaises(ZwoError):
+                with self.assertRaises(ZwoBusyError):
                     await focuser.reset_position(10_000)
             self.assertEqual(len(backend.sent_reports), 2)
 
@@ -699,7 +699,7 @@ class TestEaf(unittest.IsolatedAsyncioTestCase):
             ]
         ) as backend:
             async with await Eaf.open(DEV_PATH) as focuser:
-                with self.assertRaises(ZwoError):
+                with self.assertRaises(ZwoBusyError):
                     await focuser.move(15_000)
             self.assertEqual(len(backend.sent_reports), 2)
 
@@ -845,7 +845,7 @@ class TestEaf(unittest.IsolatedAsyncioTestCase):
             ]
         ) as backend:
             async with await Eaf.open(DEV_PATH) as focuser:
-                with self.assertRaises(ZwoError):
+                with self.assertRaises(ZwoBusyError):
                     await focuser.configure(reverse=True)
             self.assertEqual(len(backend.sent_reports), 2)
 

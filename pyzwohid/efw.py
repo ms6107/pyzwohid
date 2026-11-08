@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .hid import ZwoError, ZwoHidDevice, ZwoHidStatus, _validate_timeout
+from .hid import ZwoBusyError, ZwoError, ZwoHidDevice, ZwoHidStatus, _validate_timeout
 
 # Status query (02 01) and reply decoding
 _CMD_GET_STATUS = b"\x02\x01"
@@ -151,15 +151,15 @@ class Efw(ZwoHidDevice[EfwStatus]):
         Raises:
             ValueError: If `timeout <= 0`, `timeout` is non-finite, or `slot` is outside
                 `[1, status.slot_count]`.
-            ZwoError: If the initial status reports moving/calibrating or a HID/hardware
-                fault occurs.
+            ZwoBusyError: If the initial status reports moving/calibrating.
+            ZwoError: If a HID or hardware fault occurs.
             TimeoutError: If the wheel does not settle before `timeout` expires.
         """
         _validate_timeout(timeout)
 
         status = await self.get_status()
         if status.moving:
-            raise ZwoError("EFW is already moving")
+            raise ZwoBusyError("EFW is already moving")
         if not (1 <= slot <= status.slot_count):
             raise ValueError(f"slot={slot} outside allowed range [1, {status.slot_count}]")
 
@@ -174,7 +174,7 @@ class Efw(ZwoHidDevice[EfwStatus]):
         Executes a 3-phase sweep (~27.7–30.6 s observed on a 7-slot wheel, `fw 3.0.6`):
         1. Rotates to locate the Hall-sensor index reference.
         2. Completes a full revolution under `state == 0x00`
-           (`EfwStatus(moving=True, slot_count=-1, slot=-1)`), counting magnets
+          (`EfwStatus(moving=True, slot_count=-1, slot=-1)`), counting magnets
            `1..slot_count` in `reply[9]`.
         3. Homes with fine damping (`state == 0x04 -> 0x01`) onto **slot `1`**
            regardless of which slot was selected before calibration.
@@ -186,14 +186,14 @@ class Efw(ZwoHidDevice[EfwStatus]):
 
         Raises:
             ValueError: If `timeout <= 0` or `timeout` is non-finite.
-            ZwoError: If the initial status reports moving/calibrating or a HID/hardware
-                fault occurs.
+            ZwoBusyError: If the initial status reports moving/calibrating.
+            ZwoError: If a HID or hardware fault occurs.
             TimeoutError: If calibration does not settle before `timeout` expires.
         """
         _validate_timeout(timeout)
 
         if (await self.get_status()).moving:
-            raise ZwoError("EFW is already moving")
+            raise ZwoBusyError("EFW is already moving")
 
         await self._send(_CMD_CALIBRATE)
         return (await self._wait_until_settled(timeout, "calibrate()")).slot
