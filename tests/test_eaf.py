@@ -703,6 +703,57 @@ class TestEaf(unittest.IsolatedAsyncioTestCase):
                     await focuser.move(15_000)
             self.assertEqual(len(backend.sent_reports), 2)
 
+    async def test_move_nowait_sends_move_frame_without_polling_and_validates(self) -> None:
+        with (
+            FakeEafHidBackend(
+                replies=[
+                    _firmware_report(version=(3, 2, 2)),
+                    _status_report_legacy(state=0x00, step=10_000, max_step=40_000),
+                ]
+            ) as backend,
+            patch("pyzwohid.hid.asyncio.sleep") as mock_sleep,
+        ):
+            async with await Eaf.open(DEV_PATH) as focuser:
+                await focuser.move_nowait(12_000)
+                for bad_step in (-1, 40_001):
+                    with self.subTest(step=bad_step), self.assertRaises(ValueError):
+                        await focuser.move_nowait(bad_step)
+
+            mock_sleep.assert_not_awaited()
+            move_frames = [r for r in backend.sent_reports if r[:2] == b"\x03\x7e" and r[3:5] == b"\x03\x01"]
+            self.assertEqual(len(move_frames), 1)
+            self.assertEqual(move_frames[0][8:10], (12_000).to_bytes(2, "big"))
+
+        with FakeEafHidBackend(
+            replies=[
+                _firmware_report(version=(3, 2, 2)),
+                _status_report_legacy(state=0x01, step=10_000, max_step=40_000),
+            ]
+        ) as backend:
+            async with await Eaf.open(DEV_PATH) as focuser:
+                with self.assertRaises(ZwoBusyError):
+                    await focuser.move_nowait(15_000)
+            self.assertEqual(len(backend.sent_reports), 2)
+
+    async def test_stop_nowait_sends_stop_frame_and_returns_pre_stop_status_without_polling(self) -> None:
+        with (
+            FakeEafHidBackend(
+                replies=[
+                    _firmware_report(version=(3, 2, 2)),
+                    _status_report_legacy(state=0x01, step=30_050, max_step=60_000),
+                ]
+            ) as backend,
+            patch("pyzwohid.hid.asyncio.sleep") as mock_sleep,
+        ):
+            async with await Eaf.open(DEV_PATH) as focuser:
+                status = await focuser.stop_nowait()
+
+            mock_sleep.assert_not_awaited()
+            self.assertTrue(status.moving)
+            self.assertEqual(status.step, 30_050)
+            self.assertEqual(len(backend.sent_reports), 3)
+            self.assertEqual(backend.sent_reports[-1][3:5], b"\x03\x00")
+
     async def test_configure_legacy_and_modern_updates_settings_and_preserves_unspecified(self) -> None:
         with self.subTest("legacy_flags_and_backlash_opcode_00"):
             replies = [

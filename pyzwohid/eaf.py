@@ -357,6 +357,21 @@ class Eaf(ZwoHidDevice[EafStatus]):
             + max_step_lo
         )
 
+    async def move_nowait(self, step: int) -> None:
+        """Validate `step` (`0..max_step`) against live `02 03` telemetry and send `03 01 ...` without polling.
+
+        Not normally needed: use `move()`, which waits until the focuser settles. This method
+        exists for ASCOM Alpaca compatibility, so that an Alpaca server (whose `Move` returns
+        immediately and reports progress through `IsMoving`) can be built on top of this driver.
+        """
+        status, reply = await self._read_status_report()
+        if status.moving:
+            raise ZwoBusyError("EAF is already moving")
+        if not (0 <= step <= status.max_step):
+            raise ValueError(f"step={step} outside allowed range [0, {status.max_step}]")
+
+        await self._send(self._build_control_payload(reply, run=_RUN_MOVE, step=step, opcode=_OPCODE_MOVE_OR_STOP))
+
     async def move(self, step: int, *, timeout: float = 60.0) -> int:
         """Move to `step` (`0..max_step`), poll every 200 ms until settled, and return the settled step.
 
@@ -392,15 +407,21 @@ class Eaf(ZwoHidDevice[EafStatus]):
             TimeoutError: If the focuser does not settle before `timeout` expires.
         """
         _validate_timeout(timeout)
-
-        status, reply = await self._read_status_report()
-        if status.moving:
-            raise ZwoBusyError("EAF is already moving")
-        if not (0 <= step <= status.max_step):
-            raise ValueError(f"step={step} outside allowed range [0, {status.max_step}]")
-
-        await self._send(self._build_control_payload(reply, run=_RUN_MOVE, step=step, opcode=_OPCODE_MOVE_OR_STOP))
+        await self.move_nowait(step)
         return (await self._wait_until_settled(timeout, f"move({step})")).step
+
+    async def stop_nowait(self) -> EafStatus:
+        """Read live `02 03` telemetry, transmit `03 00 ...`, and return the pre-stop `EafStatus` without polling.
+
+        Not normally needed: use `stop()`, which waits until the focuser settles. This method
+        exists for ASCOM Alpaca compatibility, so that an Alpaca server (whose `Halt` returns
+        immediately) can be built on top of this driver.
+        """
+        status, reply = await self._read_status_report()
+        await self._send(
+            self._build_control_payload(reply, run=_RUN_STOP, step=status.step, opcode=_OPCODE_MOVE_OR_STOP)
+        )
+        return status
 
     async def stop(self, *, timeout: float = 5.0) -> int:
         """Send a stop command (`03 00 ...`, `opcode=0x00`), poll until settled, and return the settled step.
@@ -421,11 +442,7 @@ class Eaf(ZwoHidDevice[EafStatus]):
             TimeoutError: If the focuser does not settle before `timeout` expires.
         """
         _validate_timeout(timeout)
-
-        status, reply = await self._read_status_report()
-        await self._send(
-            self._build_control_payload(reply, run=_RUN_STOP, step=status.step, opcode=_OPCODE_MOVE_OR_STOP)
-        )
+        status = await self.stop_nowait()
         if not status.moving:
             return status.step
         return (await self._wait_until_settled(timeout, "stop()")).step

@@ -159,6 +159,38 @@ class TestEfw(unittest.IsolatedAsyncioTestCase):
                     bytes((0x03, 0x7E, 0x5A, 0x01, expected_dir, 6)).ljust(16, b"\x00"),
                 )
 
+    async def test_move_to_slot_nowait_sends_move_frame_without_polling_and_validates(self) -> None:
+        for unidirectional, expected_dir in ((False, 0x02), (True, 0x03)):
+            with (
+                self.subTest(unidirectional=unidirectional),
+                FakeEfwHidBackend(replies=[_status_report(slots=(1, 1, 1))]) as backend,
+                patch("pyzwohid.hid.asyncio.sleep") as mock_sleep,
+            ):
+                async with await Efw.open(DEV_PATH) as wheel:
+                    await wheel.move_to_slot_nowait(6, unidirectional=unidirectional)
+                    for bad_slot in (0, -1, SLOT_COUNT + 1):
+                        with self.subTest(slot=bad_slot), self.assertRaises(ValueError):
+                            await wheel.move_to_slot_nowait(bad_slot)
+
+                mock_sleep.assert_not_awaited()
+                move_frames = [r for r in backend.sent_reports if r[:2] == b"\x03\x7e" and r[3] == 0x01]
+                self.assertEqual(len(move_frames), 1)
+                self.assertEqual(
+                    move_frames[0],
+                    bytes((0x03, 0x7E, 0x5A, 0x01, expected_dir, 6)).ljust(16, b"\x00"),
+                )
+
+        busy_reports = [
+            ("calibrating", _status_report(state=0x00, slots=(3, 3, 3), slot_count=1)),
+            ("rotating", _status_report(state=0x04, slots=(6, 2, 3))),
+        ]
+        for label, report in busy_reports:
+            with self.subTest(case=label), FakeEfwHidBackend(replies=[report]) as backend:
+                async with await Efw.open(DEV_PATH) as wheel:
+                    with self.assertRaises(ZwoBusyError):
+                        await wheel.move_to_slot_nowait(5)
+                self.assertEqual(len(backend.sent_reports), 1)
+
     async def test_calibrate_sends_command_and_polls_until_settled(self) -> None:
         replies = [
             _status_report(slots=(3, 3, 3)),

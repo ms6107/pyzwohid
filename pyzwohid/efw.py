@@ -114,6 +114,28 @@ class Efw(ZwoHidDevice[EfwStatus]):
             return EfwStatus(moving=False, slot_count=slot_count, slot=target_slot)
         return EfwStatus(moving=True, slot_count=slot_count, slot=-1)
 
+    async def move_to_slot_nowait(
+        self,
+        slot: int,
+        *,
+        unidirectional: bool = False,
+    ) -> None:
+        """Validate `slot` (`1..slot_count`) against live `02 01` status and send `01 <02|03> <slot>` without polling.
+
+        Not normally needed: use `move_to_slot()`, which waits until the filter wheel settles. This
+        method exists for ASCOM Alpaca compatibility, so that an Alpaca server (whose `Position`
+        setter returns immediately and reports motion via `Position == -1`) can be built on top of
+        this driver.
+        """
+        status = await self.get_status()
+        if status.moving:
+            raise ZwoBusyError("EFW is already moving")
+        if not (1 <= slot <= status.slot_count):
+            raise ValueError(f"slot={slot} outside allowed range [1, {status.slot_count}]")
+
+        direction = _DIR_UNIDIRECTIONAL if unidirectional else _DIR_BIDIRECTIONAL
+        await self._send(bytes((_CMD_MOVE, direction, slot)))
+
     async def move_to_slot(
         self,
         slot: int,
@@ -156,15 +178,7 @@ class Efw(ZwoHidDevice[EfwStatus]):
             TimeoutError: If the wheel does not settle before `timeout` expires.
         """
         _validate_timeout(timeout)
-
-        status = await self.get_status()
-        if status.moving:
-            raise ZwoBusyError("EFW is already moving")
-        if not (1 <= slot <= status.slot_count):
-            raise ValueError(f"slot={slot} outside allowed range [1, {status.slot_count}]")
-
-        direction = _DIR_UNIDIRECTIONAL if unidirectional else _DIR_BIDIRECTIONAL
-        await self._send(bytes((_CMD_MOVE, direction, slot)))
+        await self.move_to_slot_nowait(slot, unidirectional=unidirectional)
         return (await self._wait_until_settled(timeout, f"move_to_slot({slot})")).slot
 
     async def calibrate(self, timeout: float = 60.0) -> int:
