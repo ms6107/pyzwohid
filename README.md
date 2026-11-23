@@ -18,6 +18,7 @@
   - [macOS](docs/macos.md)
   - [Windows](docs/windows.md)
 - [Quickstart](#quickstart)
+- [CLI](#cli)
 - [Running tests](#running-tests)
 - [License](#license)
 
@@ -90,6 +91,22 @@ async def main() -> None:
 
 
 asyncio.run(main())
+```
+
+## CLI
+
+Install exposes a `pyzwohid` command (also runnable as `python -m pyzwohid`). When `--device` is omitted, each command opens the sole matching EFW or EAF automatically and fails if zero or multiple devices of that class exist:
+
+```bash
+pyzwohid list
+pyzwohid status
+pyzwohid status eaf
+pyzwohid filter 3
+pyzwohid calibrate
+pyzwohid focus 25000
+pyzwohid focus --relative -500  # or -r -500
+pyzwohid limits --max-step 60000 --position 0
+pyzwohid help limits
 ```
 
 ## Running tests
